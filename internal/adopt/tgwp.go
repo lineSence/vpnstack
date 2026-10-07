@@ -88,17 +88,45 @@ func importTGWP(f *Found, cfg, profiles []byte, caddyfile, caddyEnv string, cadd
 	}
 }
 
-var caddyHostRe = regexp.MustCompile(`(?m)^([^\s{#][^{]*?)\s*\{\s*$`)
+// Ignore inline placeholders and quoted strings when counting block braces.
+var caddyInlineRe = regexp.MustCompile("\"(?:\\\\.|[^\"\\\\])*\"|`[^`]*`|\\{[^{}\\s]+\\}")
 
-// caddyHosts — адреса сайтов верхнего уровня Caddyfile (кроме глобального блока).
+// caddyHosts reads only top-level site headers. A regexp over the full file
+// could consume closing braces/comments across newlines as a bogus hostname.
 func caddyHosts(src string) []string {
 	var out []string
-	for _, m := range caddyHostRe.FindAllStringSubmatch(src, -1) {
-		for _, h := range strings.Split(m[1], ",") {
-			h = strings.TrimSpace(h)
-			if h != "" && !strings.HasPrefix(h, "(") {
-				out = append(out, h)
+	depth := 0
+	var header []string
+	for _, raw := range strings.Split(src, "\n") {
+		structural := caddyInlineRe.ReplaceAllString(raw, "")
+		if i := strings.IndexByte(structural, '#'); i >= 0 {
+			structural = structural[:i]
+		}
+		structural = strings.TrimSpace(structural)
+		if depth == 0 && structural != "" {
+			if i := strings.IndexByte(structural, '{'); i >= 0 {
+				// Use the original line to retain {$TPROXY_HOSTNAME}.
+				line := raw
+				if j := strings.IndexByte(line, '#'); j >= 0 {
+					line = line[:j]
+				}
+				j := strings.LastIndexByte(line, '{')
+				header = append(header, strings.TrimSpace(line[:j]))
+				for _, h := range strings.Fields(strings.Join(header, " ")) {
+					for _, host := range strings.Split(h, ",") {
+						if host != "" && !strings.HasPrefix(host, "(") {
+							out = append(out, host)
+						}
+					}
+				}
+				header = nil
+			} else if !strings.Contains(structural, "}") {
+				header = append(header, strings.TrimSpace(raw))
 			}
+		}
+		depth += strings.Count(structural, "{") - strings.Count(structural, "}")
+		if depth < 0 {
+			depth = 0
 		}
 	}
 	return out

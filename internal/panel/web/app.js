@@ -232,10 +232,13 @@ async function viewAdopt(el) {
   el.innerHTML = '<div class="card muted">Сканирование сервера…</div>';
   const d = await api('GET', '/api/adopt');
   const r = d.report || {}, found = r.found || [], ad = d.adopted || {};
+  const eligible = f => !(f.blocking || []).length && !['conflict', 'migrated', 'cleaned'].includes(f.status);
   const li = (l, cls) => (l || []).map(x => `<li class="${cls}">${esc(x)}</li>`).join('');
   el.innerHTML = `<div class="card"><h2>Найденные сервисы, установленные без vpnstack</h2>
     <p class="muted">Импорт только считывает настройки и пользователей. Перенос останавливает старую установку и запускает сервис под vpnstack с теми же портами, ключами и паролями — ссылки клиентов не меняются, клиенты переподключаются один раз (обычно 5–20 с). При сбое — автоматический откат.</p>
-    ${found.length ? found.map(f => `<div class="card"><div class="row" style="justify-content:space-between"><h3>${esc(f.title)}</h3><span class="badge">${esc(adoptRU[f.status] || f.status)}</span></div>
+    <p>Для общего Caddy выберите Hysteria и TG WEB proxy вместе. Остальные сервисы выбирать не нужно.</p>
+    <button data-ad="migrate-selected">Перенести выбранные сервисы</button>
+    ${found.length ? found.map(f => `<div class="card"><div class="row" style="justify-content:space-between"><h3>${eligible(f) ? `<input type="checkbox" style="width:auto" data-ad-select="${esc(f.id)}" aria-label="Выбрать ${esc(f.title)}"> ` : ''}${esc(f.title)}</h3><span class="badge">${esc(adoptRU[f.status] || f.status)}</span></div>
       <p>Источник: ${esc(f.origin.source)}</p>${(f.origin.ports || []).length ? `<p>Порты: ${esc(f.origin.ports.join(', '))}</p>` : ''}
       <p>Пользователи (${(f.users || []).length}): ${esc((f.users || []).slice(0, 20).join(', '))}</p>
       <ul class="problems">${li(f.warnings, '')}${li(f.risky, 'err')}${li(f.blocking, 'err')}</ul>
@@ -246,11 +249,23 @@ async function viewAdopt(el) {
   ${Object.keys(ad).length ? `<div class="card"><h2>Перенятые сервисы</h2><table><tr><th>Сервис</th><th>Состояние</th><th>Источник</th><th></th></tr>
     ${Object.entries(ad).map(([id, o]) => `<tr><td>${esc(id)}</td><td>${esc(adoptRU[o.state] || o.state)}</td><td>${esc(o.source)}</td><td>${o.state === 'migrated' ? `<button class="sec" data-ad="rollback" data-id="${esc(id)}">Откатить</button> <button class="danger" data-ad="cleanup" data-id="${esc(id)}">Удалить старую</button>` : ''}</td></tr>`).join('')}</table></div>` : ''}`;
   el.querySelectorAll('[data-ad]').forEach(b => b.onclick = async () => {
-    const a = b.dataset.ad, ids = [b.dataset.id];
+    const grouped = b.dataset.ad === 'migrate-selected';
+    const a = grouped ? 'migrate' : b.dataset.ad;
+    const ids = grouped ? [...new Set([...el.querySelectorAll('[data-ad-select]:checked')].map(x => x.dataset.adSelect))] : [b.dataset.id];
+    if (!ids.length) { alert('Выберите сервисы для переноса.'); return; }
+    const selected = found.filter(f => ids.includes(f.id));
+    if ((a === 'migrate' || a === 'import') && ids.some(id => selected.filter(f => f.id === id).length > 1)) {
+      alert('Найдено несколько установок одного сервиса. Сначала устраните неоднозначность; перенос отменён.'); return;
+    }
     let force = false;
-    if (+b.dataset.risky && (a === 'migrate' || a === 'import')) { force = confirm('Есть предупреждения (выделены красным). Всё равно переносить?'); if (!force) return; }
+    const risky = selected.flatMap(f => f.risky || []);
+    if (risky.length && (a === 'migrate' || a === 'import')) {
+      force = confirm('Предупреждения для выбранных сервисов:\n\n' + risky.join('\n') + '\n\nПродолжить?');
+      if (!force) return;
+    }
     if (a === 'migrate') {
-      if (!confirm(`Перенести ${ids[0]} под vpnstack? Клиенты переподключатся один раз.`)) return;
+      const units = [...new Set(selected.flatMap(f => f.origin.units || []))];
+      if (!confirm(`Перенести ${ids.join(', ')} под vpnstack?\nБудут остановлены: ${units.join(', ') || 'старые установки выбранных сервисов'}.\nВозможен перерыв в работе. При ошибке — автоматический откат.`)) return;
     }
     if (a === 'rollback' && !confirm('Вернуть старую установку?')) return;
     if (a === 'cleanup' && !confirm('Удалить остановленную старую установку? После этого откат невозможен.')) return;
