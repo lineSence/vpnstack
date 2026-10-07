@@ -161,6 +161,16 @@ chain awg_forward {
 }
 
 func (a *AWG) Install(env *module.Env, s *state.Service) error {
+	if err := a.Prefetch(env, s); err != nil {
+		return err
+	}
+	v, _ := a.Latest(env)
+	s.Version = v
+	return a.start(s)
+}
+
+// Prefetch ставит пакеты и модуль ядра (или userspace) заранее, не трогая интерфейсы.
+func (a *AWG) Prefetch(env *module.Env, s *state.Service) error {
 	if !sys.Has("awg") {
 		kver, _ := sys.Output("uname", "-r")
 		if err := aptInstall("software-properties-common", "gnupg"); err != nil {
@@ -180,8 +190,10 @@ func (a *AWG) Install(env *module.Env, s *state.Service) error {
 			return err
 		}
 	}
-	v, _ := a.Latest(env)
-	s.Version = v
+	return nil
+}
+
+func (a *AWG) start(s *state.Service) error {
 	if err := a.write(s); err != nil {
 		return err
 	}
@@ -220,6 +232,10 @@ func (a *AWG) userspace(env *module.Env) error {
 
 func (a *AWG) serverAddr(s *state.Service) (string, *net.IPNet) {
 	ip, n, _ := net.ParseCIDR(s.P("subnet"))
+	if v := s.P("server_ip"); v != "" { // перенятая установка: адрес сервера как был
+		ones, _ := n.Mask.Size()
+		return fmt.Sprintf("%s/%d", v, ones), n
+	}
 	ip = ip.To4()
 	gw := net.IPv4(ip[0], ip[1], ip[2], ip[3]+1)
 	ones, _ := n.Mask.Size()
@@ -245,8 +261,10 @@ func (a *AWG) obf(s *state.Service, server bool) string {
 	for i := 1; i <= 4; i++ {
 		fmt.Fprintf(&b, "H%d = %s\n", i, s.P(fmt.Sprintf("h%d", i)))
 	}
-	if v := s.P("i1"); v != "" {
-		fmt.Fprintf(&b, "I1 = %s\n", v)
+	for i := 1; i <= 5; i++ {
+		if v := s.P(fmt.Sprintf("i%d", i)); v != "" {
+			fmt.Fprintf(&b, "I%d = %s\n", i, v)
+		}
 	}
 	if awgMajor(s) >= 3 {
 		fmt.Fprintf(&b, "HeaderProtectionKey = %s\n", s.Secrets["header_protection_key"])
@@ -268,8 +286,22 @@ func (a *AWG) render(s *state.Service) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Сгенерировано vpnstack\n[Interface]\nPrivateKey = %s\nAddress = %s\nListenPort = %s\nMTU = %s\n%s",
 		s.Secrets["private_key"], addr, s.P("port"), s.P("mtu"), a.obf(s, true))
+	// Прочие параметры перенятой установки (тайминги AWG 3 и т. п.) — без изменений.
+	for _, l := range strings.Split(s.P("iface_extra"), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			b.WriteString(l + "\n")
+		}
+	}
 	for _, u := range s.Users {
-		fmt.Fprintf(&b, "\n# %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n", u.Name, u.Data["public_key"], u.Data["psk"], u.Data["ip"])
+		fmt.Fprintf(&b, "\n# %s\n[Peer]\nPublicKey = %s\n", u.Name, u.Data["public_key"])
+		if u.Data["psk"] != "" {
+			fmt.Fprintf(&b, "PresharedKey = %s\n", u.Data["psk"])
+		}
+		allowed := u.Data["allowed_ips"]
+		if allowed == "" {
+			allowed = u.Data["ip"] + "/32"
+		}
+		fmt.Fprintf(&b, "AllowedIPs = %s\n", allowed)
 	}
 	return b.String()
 }
@@ -326,7 +358,7 @@ func (a *AWG) ConfigFiles(*state.Service) []string { return []string{awgConf} }
 
 func (a *AWG) nextIP(s *state.Service) (string, error) {
 	_, n := a.serverAddr(s)
-	used := map[string]bool{}
+	used := map[string]bool{s.P("server_ip"): true}
 	for _, u := range s.Users {
 		used[u.Data["ip"]] = true
 	}
@@ -375,6 +407,12 @@ func (a *AWG) DelUser(env *module.Env, s *state.Service, name string) error {
 }
 
 func (a *AWG) Artifacts(env *module.Env, s *state.Service, u *state.User) ([]module.Artifact, error) {
+	if u.Data["private_key"] == "" {
+		return []module.Artifact{{Kind: "text", Title: "Пользователь перенят",
+			Value: "Конфиг выдан раньше и продолжает работать (ключ сервера, порт и параметры обфускации сохранены). " +
+				"Закрытый ключ клиента на сервере не хранится, поэтому показать конфиг нельзя. Новый конфиг: " +
+				"vpnstack users awg del " + u.Name + " && vpnstack users awg add " + u.Name}}, nil
+	}
 	spub, err := wgPub(s.Secrets["private_key"])
 	if err != nil {
 		return nil, err

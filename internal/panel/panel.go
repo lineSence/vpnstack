@@ -119,6 +119,8 @@ func (s *Server) Run(addr string) error {
 	mux.HandleFunc("POST /api/password", s.auth(s.password))
 	mux.HandleFunc("POST /api/ota/{action}", s.auth(s.otaAction))
 	mux.HandleFunc("POST /api/stop-unit", s.auth(s.stopUnit))
+	mux.HandleFunc("GET /api/adopt", s.auth(s.adoptScan))
+	mux.HandleFunc("POST /api/adopt/{action}", s.auth(s.adoptAction))
 	srv := &http.Server{Addr: addr, Handler: secHeaders(mux), ReadHeaderTimeout: 10 * time.Second}
 	go s.sweep()
 	return srv.ListenAndServe()
@@ -583,3 +585,55 @@ func (s *Server) stopUnit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) SetOTAInfo(in ota.Info) { s.otaInfo = in }
 
 var _ = strconv.Itoa
+
+// adoptScan — установки без vpnstack и уже перенятые сервисы.
+func (s *Server) adoptScan(w http.ResponseWriter, r *http.Request) {
+	s.E.Lock()
+	rep := s.E.AdoptScan()
+	ad := s.E.Adopted()
+	s.E.Unlock()
+	writeJSON(w, 200, map[string]any{"report": rep, "adopted": ad})
+}
+
+func (s *Server) adoptAction(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs        []string `json:"ids"`
+		Force      bool     `json:"force"`
+		NoRollback bool     `json:"no_rollback"`
+	}
+	_ = readJSON(r, &in)
+	action := r.PathValue("action")
+	var fn func() error
+	switch action {
+	case "summary":
+		s.E.Lock()
+		txt := s.E.MigrateSummary(in.IDs)
+		s.E.Unlock()
+		writeJSON(w, 200, map[string]string{"summary": txt})
+		return
+	case "import":
+		fn = func() error {
+			msgs, err := s.E.AdoptImport(in.IDs, in.Force)
+			for _, m := range msgs {
+				sys.Logf("%s", m)
+			}
+			return err
+		}
+	case "migrate":
+		fn = func() error {
+			if _, err := s.E.AdoptImport(in.IDs, in.Force); err != nil {
+				return err
+			}
+			return s.E.AdoptMigrate(in.IDs, core.MigrateOpts{Force: in.Force, NoRollback: in.NoRollback})
+		}
+	case "rollback":
+		fn = func() error { return s.E.AdoptRollback(in.IDs) }
+	case "cleanup":
+		fn = func() error { return s.E.AdoptCleanup(in.IDs) }
+	default:
+		fail(w, 404, fmt.Errorf("неизвестное действие"))
+		return
+	}
+	j := s.startJob("adopt "+action+" "+strings.Join(in.IDs, ","), fn)
+	writeJSON(w, 202, map[string]string{"job": j.ID})
+}

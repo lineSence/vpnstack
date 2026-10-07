@@ -32,12 +32,18 @@
 * Статистика: `api {listen 127.0.0.1:10085, services [HandlerService, StatsService]}`, `policy.levels.0.statsUserUplink/Downlink`;
   чтение — `xray api statsquery --server=127.0.0.1:10085` (имена `user>>>NAME>>>traffic>>>uplink|downlink`).
 * Ссылка: `vless://UUID@IP:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=…&fp=chrome&pbk=…&sid=…&type=tcp#NAME`.
+* Пользователи меняются без перезапуска: `xray api adu --server=127.0.0.1:10085 <json с inbound>` /
+  `xray api rmu --server=127.0.0.1:10085 -tag=vless-reality NAME`; при ошибке API — перезапуск. `flow` у клиента
+  может быть пустым (перенятые клиенты без Vision), `shortIds`/`serverNames` — списки.
 * SNI по умолчанию `www.microsoft.com` — меняйте на сайт с TLS 1.3 + HTTP/2, близкий к серверу; он не должен
   пересекаться с доменами FPTN и telemt.
 
 ## Hysteria 2
 
-* `listen :443`, `tls {cert, key}` (файлы перечитываются на лету), `auth {type: userpass, userpass: {name: pass}}`,
+* `listen :443`, `tls {cert, key}` (файлы перечитываются на лету),
+  `auth {type: command, command: /usr/local/lib/vpnstack/vpnstack-hy-auth}` — ссылка на бинарник vpnstack; он
+  проверяет `user:pass` (и общие пароли перенятых установок) по `/etc/vpnstack/hysteria/auth.json`, поэтому
+  пользователи добавляются без перезапуска, удалённые отключаются через `POST /kick`.
   `trafficStats {listen 127.0.0.1:9998, secret}`, `masquerade {type: file, file.dir: /var/lib/vpnstack/site}`,
   опционально `obfs.salamander` и `bandwidth`.
 * API статистики: `GET /traffic` → `{"user": {"tx": N, "rx": N}}`, `GET /online`, `POST /kick`; заголовок `Authorization: <secret>`.
@@ -52,7 +58,7 @@
   `proxy_protocol_trusted_cidrs = ["127.0.0.1/32"]`, `[[server.listeners]] ip = "127.0.0.1"`,
   `[server.api] listen = "127.0.0.1:9091"`, `whitelist`, `auth_header`,
   `[censorship] tls_domain`, `mask = true`, `tls_emulation = true`, `tls_front_dir`, `mask_host/mask_port`,
-  `[access.users] name = "32 hex"`.
+  `[access.users] name = "32 hex"`; изменения `[access]` применяются по SIGHUP без перезапуска.
 * Если домен fake-TLS указывает на сервер — `mask_host = 127.0.0.1`, `mask_port = 7443`: сканеры получают настоящий
   сайт Caddy с валидным сертификатом этого домена. Иначе маскировка идёт на сам `tls_domain:443`.
 * Ссылка: `tg://proxy?server=HOST&port=443&secret=ee<32 hex><hex(tls_domain)>`.

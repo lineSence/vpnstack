@@ -207,7 +207,36 @@ func (t *TGWP) runInstaller(env *module.Env, s *state.Service) error {
 	return nil
 }
 
-func (t *TGWP) Install(env *module.Env, s *state.Service) error { return t.runInstaller(env, s) }
+func (t *TGWP) Install(env *module.Env, s *state.Service) error {
+	if s.Params["adopted_inplace"] == "true" {
+		return t.adoptInPlace(s)
+	}
+	return t.runInstaller(env, s)
+}
+
+// adoptInPlace — перенятая установка tproxy-server остаётся как есть (те же секрет, путь,
+// ключ токенов): vpnstack лишь заменяет её Caddy своим и следит за юнитами.
+func (t *TGWP) adoptInPlace(s *state.Service) error {
+	if b, err := os.ReadFile("/etc/tproxy-server/config.json"); err == nil {
+		var c struct {
+			BasePath string `json:"base_path"`
+		}
+		if json.Unmarshal(b, &c) == nil {
+			s.Params["active_base_path"] = c.BasePath
+		}
+	}
+	if s.Version == "" {
+		s.Version = "перенят"
+	}
+	for _, u := range t.units {
+		if !sys.Active(u) {
+			if err := sys.Systemctl("start", u); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 
 func (t *TGWP) Apply(env *module.Env, s *state.Service) error { return t.runInstaller(env, s) }
 

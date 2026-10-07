@@ -74,6 +74,7 @@ func Run(e *core.Engine) error {
 		fmt.Println(" 6) Удалить сервис")
 		fmt.Println(" 7) Панель управления")
 		fmt.Println(" 8) Общие настройки")
+		fmt.Println(" 9) Перенос существующих сервисов (установленных без vpnstack)")
 		fmt.Println(" 0) Выход")
 		switch ask("Выбор", "") {
 		case "1":
@@ -92,6 +93,8 @@ func Run(e *core.Engine) error {
 			panelMenu(e)
 		case "8":
 			settings(e)
+		case "9":
+			adoptMenu(e)
 		case "0", "q", "":
 			return nil
 		}

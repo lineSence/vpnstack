@@ -34,8 +34,11 @@ func (h *Hysteria) Params() []module.Param {
 		{Key: "domain", Label: "Домен", Type: module.TDomain,
 			Help: "Поддомен, указывающий на сервер (сертификат выпустит Caddy). Пусто — самоподписанный сертификат с привязкой отпечатка."},
 		{Key: "port", Label: "UDP-порт", Type: module.TPort, Advanced: true, Restart: true},
-		{Key: "obfs", Label: "Обфускация Salamander", Type: module.TBool, Advanced: true,
+		{Key: "obfs", Label: "Обфускация", Type: module.TBool, Advanced: true,
 			Help: "Пакеты перестают быть похожи на QUIC/HTTP3; маскировка под сайт при этом не работает."},
+		{Key: "obfs_type", Label: "Тип обфускации", Type: module.TSelect, Options: []string{"salamander", "gecko"}, Advanced: true},
+		{Key: "sni", Label: "SNI самоподписанного сертификата", Type: module.TString, Advanced: true,
+			Help: "Используется только без домена: имя в сертификате и в ссылках."},
 		{Key: "up_mbps", Label: "Канал сервера вверх, Мбит/с (0 — BBR)", Type: module.TInt, Advanced: true},
 		{Key: "down_mbps", Label: "Канал сервера вниз, Мбит/с (0 — BBR)", Type: module.TInt, Advanced: true},
 	}
@@ -44,6 +47,8 @@ func (h *Hysteria) Params() []module.Param {
 func (h *Hysteria) AutoDefaults(env *module.Env, s *state.Service) error {
 	s.Default("port", "443")
 	s.Default("obfs", "false")
+	s.Default("obfs_type", "salamander")
+	s.Default("sni", "bing.com")
 	s.Default("up_mbps", "0")
 	s.Default("down_mbps", "0")
 	s.Secret("stats_secret", func() string { return sys.RandHex(16) })
@@ -76,6 +81,9 @@ func (h *Hysteria) download(env *module.Env) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if haveBin(h.bin(), tag) {
+		return tag, nil
+	}
 	rel, err := sys.ReleaseByTag(hyRepo, tag)
 	if err != nil {
 		return "", err
@@ -97,7 +105,7 @@ func (h *Hysteria) download(env *module.Env) (string, error) {
 	if err := sys.DownloadVerified(a.URL, tmp, sys.ChecksumFor(sums, name)); err != nil {
 		return "", err
 	}
-	return tag, sys.InstallBinary(tmp, h.bin())
+	return tag, installBin(tmp, h.bin(), tag)
 }
 
 func cpuHasAVX() bool {
@@ -116,7 +124,7 @@ func (h *Hysteria) syncCert(env *module.Env, s *state.Service, wait time.Duratio
 	d := s.P("domain")
 	if d == "" {
 		if !sys.Exists(cert) || s.Secrets["self_signed"] != "true" {
-			fp, err := selfSigned(cert, key, "bing.com")
+			fp, err := selfSigned(cert, key, firstNonEmpty(s.P("sni"), "bing.com"))
 			if err != nil {
 				return err
 			}
@@ -139,7 +147,12 @@ func (h *Hysteria) syncCert(env *module.Env, s *state.Service, wait time.Duratio
 			_, _ = sys.Run("chgrp", "hysteria", key)
 			return nil
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(deadline) || (wait > 0 && certValidFor(cert, d, 72*time.Hour)) {
+			if certValidFor(cert, d, 72*time.Hour) {
+				// Перенос: пока Caddy получает свой сертификат, работаем на перенятом.
+				_, _ = sys.Run("chgrp", "hysteria", key)
+				return nil
+			}
 			return fmt.Errorf("Caddy не выпустил сертификат для %s: проверьте A-запись и доступность TCP 80/443 (journalctl -u vpnstack-caddy)", d)
 		}
 		time.Sleep(3 * time.Second)
@@ -162,18 +175,25 @@ func (h *Hysteria) render(s *state.Service) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Сгенерировано vpnstack\nlisten: :%s\n\ntls:\n  cert: %s\n  key: %s\n", s.P("port"), cert, key)
 	if boolP(s, "obfs") {
-		fmt.Fprintf(&b, "\nobfs:\n  type: salamander\n  salamander:\n    password: %s\n", yq(s.Secrets["obfs_password"]))
+		if s.P("obfs_type") == "gecko" {
+			fmt.Fprintf(&b, "\nobfs:\n  type: gecko\n  gecko:\n    password: %s\n", yq(s.Secrets["obfs_password"]))
+			if v := atoi(s.P("gecko_min")); v > 0 {
+				fmt.Fprintf(&b, "    minPacketSize: %d\n", v)
+			}
+			if v := atoi(s.P("gecko_max")); v > 0 {
+				fmt.Fprintf(&b, "    maxPacketSize: %d\n", v)
+			}
+		} else {
+			fmt.Fprintf(&b, "\nobfs:\n  type: salamander\n  salamander:\n    password: %s\n", yq(s.Secrets["obfs_password"]))
+		}
 	}
 	if up, down := atoi(s.P("up_mbps")), atoi(s.P("down_mbps")); up > 0 && down > 0 {
 		fmt.Fprintf(&b, "\nbandwidth:\n  up: %d mbps\n  down: %d mbps\n", up, down)
 	}
-	b.WriteString("\nauth:\n  type: userpass\n  userpass:\n")
-	if len(s.Users) == 0 {
-		fmt.Fprintf(&b, "    %s: %s\n", yq("_placeholder"), yq(sys.RandHex(16)))
-	}
-	for _, u := range s.Users {
-		fmt.Fprintf(&b, "    %s: %s\n", yq(u.Name), yq(u.Data["password"]))
-	}
+	// Пользователи проверяются командой vpnstack-hy-auth по файлу auth.json: добавление и
+	// удаление не требуют перезапуска, а перенятый общий пароль (auth.type: password)
+	// продолжает работать рядом с личными логинами.
+	fmt.Fprintf(&b, "\nauth:\n  type: command\n  command: %s\n", HyAuthPath)
 	fmt.Fprintf(&b, "\ntrafficStats:\n  listen: %s\n  secret: %s\n", hyStats, yq(s.Secrets["stats_secret"]))
 	if !boolP(s, "obfs") {
 		fmt.Fprintf(&b, "\nmasquerade:\n  type: file\n  file:\n    dir: %s\n", SiteDir)
@@ -182,6 +202,9 @@ func (h *Hysteria) render(s *state.Service) string {
 }
 
 func (h *Hysteria) write(s *state.Service) error {
+	if err := h.writeAuth(s); err != nil {
+		return err
+	}
 	if err := sys.WriteFileAtomic(h.cfgPath(), []byte(h.render(s)), 0o640); err != nil {
 		return err
 	}
@@ -262,7 +285,8 @@ func (h *Hysteria) AddUser(env *module.Env, s *state.Service, name string, opts 
 	}
 	s.Users = append(s.Users, u)
 	if s.Installed {
-		if err := h.Apply(env, s); err != nil {
+		// Без перезапуска: команда авторизации читает auth.json при каждом подключении.
+		if err := h.writeAuth(s); err != nil {
 			s.RemoveUser(name)
 			return nil, err
 		}
@@ -274,6 +298,37 @@ func (h *Hysteria) DelUser(env *module.Env, s *state.Service, name string) error
 	if !s.RemoveUser(name) {
 		return fmt.Errorf("нет пользователя %s", name)
 	}
+	if err := h.writeAuth(s); err != nil {
+		return err
+	}
+	h.kick(s, name) // разорвать уже открытые сессии удалённого пользователя
+	return nil
+}
+
+// kick разрывает сессии пользователя через trafficStats API.
+func (h *Hysteria) kick(s *state.Service, ids ...string) {
+	body, _ := json.Marshal(ids)
+	req, _ := http.NewRequest("POST", "http://"+hyStats+"/kick", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", s.Secrets["stats_secret"])
+	req.Header.Set("Content-Type", "application/json")
+	if resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+// Prefetch скачивает Hysteria заранее.
+func (h *Hysteria) Prefetch(env *module.Env, s *state.Service) error {
+	_, err := h.download(env)
+	return err
+}
+
+// Rollback возвращает предыдущую версию Hysteria.
+func (h *Hysteria) Rollback(env *module.Env, s *state.Service, prev string) error {
+	tag, err := restoreBin(h.bin())
+	if err != nil {
+		return err
+	}
+	s.Version = firstNonEmpty(tag, prev)
 	return h.Apply(env, s)
 }
 
@@ -284,15 +339,19 @@ func (h *Hysteria) Artifacts(env *module.Env, s *state.Service, u *state.User) (
 		hostName = d
 		q.Set("sni", d)
 	} else {
-		q.Set("sni", "bing.com")
+		q.Set("sni", firstNonEmpty(s.P("sni"), "bing.com"))
 		q.Set("insecure", "1")
 		q.Set("pinSHA256", s.Secrets["pin_sha256"])
 	}
 	if boolP(s, "obfs") {
-		q.Set("obfs", "salamander")
+		q.Set("obfs", firstNonEmpty(s.P("obfs_type"), "salamander"))
 		q.Set("obfs-password", s.Secrets["obfs_password"])
 	}
-	auth := url.UserPassword(u.Name, u.Data["password"]).String()
+	auth := url.UserPassword(hyLogin(u), u.Data["password"]).String()
+	if u.Data["legacy"] == "1" {
+		// Перенятый общий пароль: в ссылке только пароль, как было у клиентов.
+		auth = url.User(u.Data["password"]).String()
+	}
 	link := fmt.Sprintf("hysteria2://%s@%s:%s/?%s#%s", auth, hostName, s.P("port"), q.Encode(), url.PathEscape(u.Name))
 	return []module.Artifact{{Kind: "uri", Title: "Ссылка Hysteria 2 (Hiddify, NekoBox, v2rayN, Streisand, Karing)", Value: link, QR: true}}, nil
 }

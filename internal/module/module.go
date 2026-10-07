@@ -54,6 +54,8 @@ type Need struct {
 	Purpose string     `json:"purpose"`         // для сообщений о конфликтах
 	Param   string     `json:"param,omitempty"` // параметр, куда записать выбранный порт
 	Edge    *EdgeRoute `json:"edge,omitempty"`  // публичный TCP 443 через общий вход
+	// Redirect — порт не слушается программой: nftables перенаправляет его на общий вход.
+	Redirect bool `json:"redirect,omitempty"`
 }
 
 // Status — состояние сервиса.
@@ -174,4 +176,15 @@ type Configurer interface {
 // Ticker — сервису нужны периодические действия (продление сертификата и т. п.).
 type Ticker interface {
 	Tick(env *Env, s *state.Service)
+}
+
+// Fetcher — сервис умеет заранее скачать/подготовить всё нужное, не трогая работающие
+// программы. Используется при переносе, чтобы простой длился секунды, а не минуты.
+type Fetcher interface {
+	Prefetch(env *Env, s *state.Service) error
+}
+
+// Rollbacker — сервис умеет вернуть предыдущую версию после неудачного обновления.
+type Rollbacker interface {
+	Rollback(env *Env, s *state.Service, prevVersion string) error
 }

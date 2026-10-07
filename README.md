@@ -105,6 +105,18 @@ git tag v0.1.0 && git push --tags     # GitHub Actions соберёт amd64/arm6
 Сборка без открытого ключа OTA не выполняет (кроме `VPNSTACK_OTA_ALLOW_UNSIGNED=1`).
 Для приватного репозитория OTA использует токен из `/etc/vpnstack/env`.
 
+## Перенос уже установленных сервисов
+
+Сервисы, поставленные без vpnstack (вручную, скриптами, в Docker, через 3x-ui или AmneziaVPN), переносятся без смены
+ссылок у клиентов: те же порты, ключи, UUID, пароли и секреты, простой — одно переподключение (обычно 5–20 с),
+при сбое — автоматический откат.
+
+```bash
+sudo vpnstack adopt scan && sudo vpnstack adopt import all && sudo vpnstack adopt migrate all
+```
+
+Подробно: [docs/MIGRATION.md](docs/MIGRATION.md).
+
 ## Свои сервисы
 
 Новые сервисы добавляются без пересборки: каталог `/etc/vpnstack/modules.d/<id>/` с `module.json` и скриптами-хуками
@@ -123,6 +135,8 @@ vpnstack links tgwp
 vpnstack status | plan | doctor | modules
 vpnstack update [svc|all] | self-update [--check]
 vpnstack remove <svc> [--purge]
+vpnstack adopt scan|import|migrate|status|rollback|cleanup
+vpnstack route list|add <sni> <host:port>|del <N>
 ```
 
 ## Ограничения и заметки
@@ -136,4 +150,6 @@ vpnstack remove <svc> [--purge]
 * **AmneziaWG**: модуль ядра из PPA `amnezia/ppa`; если не собрался — userspace `amneziawg-go` из исходников.
   По умолчанию AWG 3.1 (HeaderProtectionKey, ContentPaddingAddition, RandomTrailers) — нужны клиенты с поддержкой AWG 3 (AmneziaVPN 5.0+). Для старых клиентов — `awg_version=2.0` или `1.5`.
 * SNI разных сервисов на общем входе не должны пересекаться (с учётом поддоменов) — `vpnstack plan` это проверяет.
-* Перезапуск Xray/Hysteria/telemt при изменении пользователей кратко рвёт текущие соединения этого сервиса.
+* Пользователи добавляются и удаляются без перезапуска сервисов: Xray — через API (`adu`/`rmu`), Hysteria — внешняя
+  проверка паролей (`auth: command`), telemt — перечитывает `[access]` по SIGHUP, AWG — `awg syncconf`.
+* `vpnstack update` проверяет сервис после обновления и при сбое возвращает предыдущую версию.

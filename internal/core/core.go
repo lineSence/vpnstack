@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -140,6 +141,9 @@ func (e *Engine) Install(id string, params map[string]string) error {
 	if err != nil {
 		return err
 	}
+	if s := e.St.Services[id]; s != nil && s.Origin != nil && (s.Origin.State == state.OriginImported || s.Origin.State == state.OriginRolledBack) {
+		return fmt.Errorf("%s импортирован из существующей установки — запускайте перенос: vpnstack adopt migrate %s", m.Title(), id)
+	}
 	r, err := e.Prepare(id, params)
 	if err != nil {
 		return err
@@ -250,12 +254,71 @@ func (e *Engine) Update(id string) error {
 	if !s.Installed {
 		return fmt.Errorf("%s не установлен", m.Title())
 	}
-	sys.Logf("==> Обновление %s (сейчас %s)", m.Title(), s.Version)
-	if err := m.Update(e.Env, s); err != nil {
-		return err
+	prev := s.Version
+	sys.Logf("==> Обновление %s (сейчас %s)", m.Title(), prev)
+	err = m.Update(e.Env, s)
+	if err == nil && s.Version != prev {
+		err = e.probe([]string{id}, 30*time.Second)
+	}
+	if err != nil {
+		rb, ok := m.(module.Rollbacker)
+		if !ok || prev == "" || s.Version == prev {
+			_ = e.St.Save()
+			return err
+		}
+		sys.Logf("[!] %v", err)
+		sys.Logf("==> Возвращаю предыдущую версию %s", prev)
+		if rerr := rb.Rollback(e.Env, s, prev); rerr != nil {
+			s.Error = rerr.Error()
+			_ = e.St.Save()
+			return fmt.Errorf("обновление не удалось: %w; откат тоже с ошибкой: %v", err, rerr)
+		}
+		s.Version, s.Error = prev, ""
+		_ = e.St.Save()
+		return fmt.Errorf("обновление не удалось, возвращена версия %s: %w", prev, err)
 	}
 	sys.Logf("    версия: %s", s.Version)
 	return e.St.Save()
+}
+
+// AddRoute добавляет посторонний сайт/сервис за общим входом 443 (по SNI).
+func (e *Engine) AddRoute(r state.Route) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(r.SNI) == 0 || r.Backend == "" {
+		return fmt.Errorf("нужны SNI и адрес backend (host:port)")
+	}
+	if _, _, err := net.SplitHostPort(r.Backend); err != nil {
+		return fmt.Errorf("backend %q: нужен host:port", r.Backend)
+	}
+	for i, x := range e.St.ExtraRoutes {
+		for _, a := range x.SNI {
+			for _, b := range r.SNI {
+				if strings.EqualFold(a, b) {
+					return fmt.Errorf("SNI %s уже в маршруте %d (%s)", b, i+1, x.Backend)
+				}
+			}
+		}
+	}
+	e.St.ExtraRoutes = append(e.St.ExtraRoutes, r)
+	return e.infra()
+}
+
+// DelRoute удаляет посторонний маршрут по номеру (с 1) или SNI.
+func (e *Engine) DelRoute(key string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i, x := range e.St.ExtraRoutes {
+		hit := fmt.Sprint(i+1) == key
+		for _, s := range x.SNI {
+			hit = hit || strings.EqualFold(s, key)
+		}
+		if hit {
+			e.St.ExtraRoutes = append(e.St.ExtraRoutes[:i], e.St.ExtraRoutes[i+1:]...)
+			return e.infra()
+		}
+	}
+	return fmt.Errorf("маршрут %q не найден", key)
 }
 
 // ApplyAll перегенерирует всё (после OTA, смены режима и т. п.).
@@ -322,7 +385,7 @@ func (e *Engine) infra() error {
 }
 
 func (e *Engine) firewall() error {
-	var sp netfilter.Spec
+	sp := netfilter.Spec{EdgePort: e.Env.EdgePort}
 	sysctls := map[string]string{}
 	ids := plan.Active(e.St)
 	if e.last.NeedCaddy {
@@ -337,6 +400,8 @@ func (e *Engine) firewall() error {
 		s := e.St.Svc(id)
 		for _, n := range m.Needs(e.Env, s) {
 			switch {
+			case n.Redirect && n.Proto == "tcp" && n.Port > 0:
+				sp.Redirect = append(sp.Redirect, n.Port)
 			case n.Proto == "tcp" && !n.Public && n.Port > 0 && !tcpSeen[n.Port]:
 				tcpSeen[n.Port] = true
 				sp.InternalTCP = append(sp.InternalTCP, n.Port)

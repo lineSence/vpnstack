@@ -42,6 +42,8 @@ func (f *FPTN) Params() []module.Param {
 		{Key: "torrent_filter", Label: "Блокировать BitTorrent", Type: module.TBool, Advanced: true, Restart: true},
 		{Key: "spam_filter", Label: "Блокировать спам-трафик (SMTP и т. п.)", Type: module.TBool, Advanced: true, Restart: true},
 		{Key: "mtu", Label: "MTU", Type: module.TInt, Advanced: true, Restart: true},
+		{Key: "legacy_tcp", Label: "Старые TCP-порты → общий вход", Type: module.TList, Advanced: true, Restart: true,
+			Help: "Порты прежней установки: перенаправляются на 443, выданные токены продолжают работать."},
 	}
 }
 
@@ -69,8 +71,9 @@ func (f *FPTN) AutoDefaults(env *module.Env, s *state.Service) error {
 
 func (f *FPTN) Needs(env *module.Env, s *state.Service) []module.Need {
 	if env.EdgeEnabled {
-		return []module.Need{{Proto: "tcp", Port: fptnLocal, Purpose: "FPTN за общим входом",
+		n := []module.Need{{Proto: "tcp", Port: fptnLocal, Purpose: "FPTN за общим входом",
 			Edge: &module.EdgeRoute{SNI: list(s, "sni_list"), Backend: fmt.Sprintf("127.0.0.1:%d", fptnLocal), Priority: 20}}}
+		return append(n, legacyNeeds(s, "FPTN")...)
 	}
 	return []module.Need{{Proto: "tcp", Port: atoi(s.P("port")), Public: true, Param: "port", Purpose: "FPTN"}}
 }
@@ -191,11 +194,13 @@ func (f *FPTN) Install(env *module.Env, s *state.Service) error {
 	if err := ensureDocker(); err != nil {
 		return err
 	}
-	v, err := f.Latest(env)
-	if err != nil {
-		return err
+	if s.Version == "" { // перенятая установка сохраняет свою версию образа до обновления
+		v, err := f.Latest(env)
+		if err != nil {
+			return err
+		}
+		s.Version = v
 	}
-	s.Version = v
 	if err := sys.EnsureSlice(f.id, f.title); err != nil {
 		return err
 	}
@@ -283,6 +288,34 @@ func (f *FPTN) Update(env *module.Env, s *state.Service) error {
 	return err
 }
 
+// Prefetch ставит Docker и скачивает образ заранее.
+func (f *FPTN) Prefetch(env *module.Env, s *state.Service) error {
+	if err := ensureDocker(); err != nil {
+		return err
+	}
+	v := s.Version
+	if v == "" {
+		var err error
+		if v, err = f.Latest(env); err != nil {
+			return err
+		}
+	}
+	_, err := sys.Run("docker", "pull", fptnImage+":"+v)
+	return err
+}
+
+// Rollback возвращает предыдущий образ (он остаётся в локальном кэше Docker).
+func (f *FPTN) Rollback(env *module.Env, s *state.Service, prev string) error {
+	if prev == "" {
+		return fmt.Errorf("неизвестна предыдущая версия FPTN")
+	}
+	s.Version = prev
+	return f.Apply(env, s)
+}
+
+// DataDir — каталог данных контейнера (/etc/fptn внутри): ключи сервера, users.list.
+func FPTNDataDir() string { return filepath.Join(fptnDir, "fptn-server-data") }
+
 func (f *FPTN) ConfigFiles(*state.Service) []string {
 	return []string{filepath.Join(fptnDir, "docker-compose.yml"), filepath.Join(fptnDir, "fptn.env")}
 }
@@ -319,7 +352,11 @@ func (f *FPTN) AddUser(env *module.Env, s *state.Service, name string, opts map[
 }
 
 func (f *FPTN) DelUser(env *module.Env, s *state.Service, name string) error {
-	if _, err := f.dc("exec", "-T", "fptn-server", "fptn-passwd", "--del-user", name); err != nil {
+	login := name
+	if u := s.FindUser(name); u != nil && u.Data["login"] != "" {
+		login = u.Data["login"]
+	}
+	if _, err := f.dc("exec", "-T", "fptn-server", "fptn-passwd", "--del-user", login); err != nil {
 		return err
 	}
 	s.RemoveUser(name)
@@ -327,6 +364,12 @@ func (f *FPTN) DelUser(env *module.Env, s *state.Service, name string) error {
 }
 
 func (f *FPTN) Artifacts(env *module.Env, s *state.Service, u *state.User) ([]module.Artifact, error) {
+	if u.Data["imported"] == "1" && u.Data["token"] == "" {
+		return []module.Artifact{{Kind: "text", Title: "Пользователь перенят",
+			Value: "Токен выдан раньше и продолжает работать (ключи сервера и users.list перенесены). " +
+				"Пароль хранится только в виде хеша, поэтому показать токен нельзя. Новый токен: " +
+				"vpnstack users fptn del " + u.Name + " && vpnstack users fptn add " + u.Name}}, nil
+	}
 	if t := u.Data["token"]; t != "" {
 		return []module.Artifact{{Kind: "token", Title: "Токен FPTN (вставить в клиент FPTN)", Value: t, QR: true}}, nil
 	}

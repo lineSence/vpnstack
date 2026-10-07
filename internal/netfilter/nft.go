@@ -25,6 +25,9 @@ type Spec struct {
 	InternalTCP []int     // порты только для loopback
 	UDP         []Counter // публичные UDP-порты с учётом трафика
 	Extra       []string  // цепочки модулей
+	// Redirect — старые TCP-порты перенятых установок: перенаправляются на общий вход.
+	Redirect []int
+	EdgePort int
 }
 
 func cname(id, dir string) string { return strings.ReplaceAll(id, "-", "_") + "_" + dir }
@@ -53,6 +56,18 @@ func Render(sp Spec) string {
 		fmt.Fprintf(&b, "\t\tudp sport %d counter name %s\n", c.Port, cname(c.Service, "tx"))
 	}
 	b.WriteString("\t}\n")
+	if len(sp.Redirect) > 0 {
+		sort.Ints(sp.Redirect)
+		var ps []string
+		for _, p := range sp.Redirect {
+			ps = append(ps, fmt.Sprint(p))
+		}
+		port := sp.EdgePort
+		if port == 0 {
+			port = 443
+		}
+		fmt.Fprintf(&b, "\n\tchain legacy_redirect {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t\tfib daddr type local tcp dport { %s } redirect to :%d\n\t}\n", strings.Join(ps, ", "), port)
+	}
 	for _, e := range sp.Extra {
 		for _, l := range strings.Split(strings.TrimRight(e, "\n"), "\n") {
 			b.WriteString("\n\t" + l)

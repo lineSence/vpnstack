@@ -226,6 +226,39 @@ function watchJob(id, after) {
   tick();
 }
 
+// ---------- Перенос существующих установок ----------
+const adoptRU = {new: 'новый', imported: 'импортирован', migrated: 'перенесён', rolled_back: 'откачен', cleaned: 'перенесён, старая удалена', conflict: 'конфликт'};
+async function viewAdopt(el) {
+  el.innerHTML = '<div class="card muted">Сканирование сервера…</div>';
+  const d = await api('GET', '/api/adopt');
+  const r = d.report || {}, found = r.found || [], ad = d.adopted || {};
+  const li = (l, cls) => (l || []).map(x => `<li class="${cls}">${esc(x)}</li>`).join('');
+  el.innerHTML = `<div class="card"><h2>Найденные сервисы, установленные без vpnstack</h2>
+    <p class="muted">Импорт только считывает настройки и пользователей. Перенос останавливает старую установку и запускает сервис под vpnstack с теми же портами, ключами и паролями — ссылки клиентов не меняются, клиенты переподключаются один раз (обычно 5–20 с). При сбое — автоматический откат.</p>
+    ${found.length ? found.map(f => `<div class="card"><div class="row" style="justify-content:space-between"><h3>${esc(f.title)}</h3><span class="badge">${esc(adoptRU[f.status] || f.status)}</span></div>
+      <p>Источник: ${esc(f.origin.source)}</p>${(f.origin.ports || []).length ? `<p>Порты: ${esc(f.origin.ports.join(', '))}</p>` : ''}
+      <p>Пользователи (${(f.users || []).length}): ${esc((f.users || []).slice(0, 20).join(', '))}</p>
+      <ul class="problems">${li(f.warnings, '')}${li(f.risky, 'err')}${li(f.blocking, 'err')}</ul>
+      ${(f.blocking || []).length || f.status === 'conflict' || f.status === 'migrated' || f.status === 'cleaned' ? '' : `<div class="row">
+        <button data-ad="migrate" data-id="${esc(f.id)}" data-risky="${(f.risky || []).length}">Перенести</button>
+        <button class="sec" data-ad="import" data-id="${esc(f.id)}" data-risky="${(f.risky || []).length}">Только импорт</button></div>`}</div>`).join('') : '<p>Не найдено.</p>'}
+    ${(r.foreign || []).length ? `<h3>Посторонние программы на нужных портах</h3><ul class="problems">${r.foreign.map(x => `<li>${esc(x.proto)}/${x.port} — ${esc(x.process)} ${esc(x.unit || '')}: ${esc(x.hint)}</li>`).join('')}</ul>` : ''}</div>
+  ${Object.keys(ad).length ? `<div class="card"><h2>Перенятые сервисы</h2><table><tr><th>Сервис</th><th>Состояние</th><th>Источник</th><th></th></tr>
+    ${Object.entries(ad).map(([id, o]) => `<tr><td>${esc(id)}</td><td>${esc(adoptRU[o.state] || o.state)}</td><td>${esc(o.source)}</td><td>${o.state === 'migrated' ? `<button class="sec" data-ad="rollback" data-id="${esc(id)}">Откатить</button> <button class="danger" data-ad="cleanup" data-id="${esc(id)}">Удалить старую</button>` : ''}</td></tr>`).join('')}</table></div>` : ''}`;
+  el.querySelectorAll('[data-ad]').forEach(b => b.onclick = async () => {
+    const a = b.dataset.ad, ids = [b.dataset.id];
+    let force = false;
+    if (+b.dataset.risky && (a === 'migrate' || a === 'import')) { force = confirm('Есть предупреждения (выделены красным). Всё равно переносить?'); if (!force) return; }
+    if (a === 'migrate') {
+      if (!confirm(`Перенести ${ids[0]} под vpnstack? Клиенты переподключатся один раз.`)) return;
+    }
+    if (a === 'rollback' && !confirm('Вернуть старую установку?')) return;
+    if (a === 'cleanup' && !confirm('Удалить остановленную старую установку? После этого откат невозможен.')) return;
+    const j = await api('POST', '/api/adopt/' + a, {ids, force});
+    watchJob(j.job);
+  });
+}
+
 // ---------- Задачи ----------
 async function viewJobs(el) {
   const jobs = await api('GET', '/api/jobs');
@@ -259,7 +292,7 @@ async function viewSettings(el) {
   $('#pw').onsubmit = async e => { e.preventDefault(); try { await api('POST', '/api/password', Object.fromEntries(new FormData(e.target))); alert('Пароль изменён'); } catch (er) { alert(er.message); } };
 }
 
-const views = {overview: viewOverview, services: viewServices, jobs: viewJobs, settings: viewSettings};
+const views = {overview: viewOverview, services: viewServices, adopt: viewAdopt, jobs: viewJobs, settings: viewSettings};
 async function route() {
   const tab = (location.hash || '#overview').slice(1);
   document.querySelectorAll('header nav a').forEach(a => a.classList.toggle('active', a.dataset.tab === tab));

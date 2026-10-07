@@ -2,6 +2,7 @@ package modules
 
 import (
 	"encoding/base64"
+	"os"
 	"strings"
 	"testing"
 
@@ -61,7 +62,7 @@ func TestHysteriaRender(t *testing.T) {
 	_ = h.AutoDefaults(env, s)
 	s.Users = []*state.User{{Name: "bob", Data: map[string]string{"password": "p@ss:word"}}}
 	y := h.render(s)
-	for _, want := range []string{"listen: :443", "type: userpass", `"bob": "p@ss:word"`, "trafficStats:", "masquerade:"} {
+	for _, want := range []string{"listen: :443", "type: command", "command: " + HyAuthPath, "trafficStats:", "masquerade:"} {
 		if !strings.Contains(y, want) {
 			t.Errorf("нет %q:\n%s", want, y)
 		}
@@ -69,6 +70,40 @@ func TestHysteriaRender(t *testing.T) {
 	a, _ := h.Artifacts(env, s, s.Users[0])
 	if !strings.HasPrefix(a[0].Value, "hysteria2://bob:p%40ss%3Aword@hy.example.com:443/?sni=hy.example.com") {
 		t.Fatalf("ссылка: %s", a[0].Value)
+	}
+	legacy := &state.User{Name: "legacy", Data: map[string]string{"password": "oldpw", "legacy": "1"}}
+	a, _ = h.Artifacts(env, s, legacy)
+	if !strings.HasPrefix(a[0].Value, "hysteria2://oldpw@hy.example.com:443/") {
+		t.Fatalf("ссылка общего пароля: %s", a[0].Value)
+	}
+}
+
+func TestHyAuth(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/auth.json"
+	f := `{"users":{"bob":{"name":"Bob","pass":"p@ss:word"}},"shared":{"old:shared":"legacy"}}`
+	if err := os.WriteFile(path, []byte(f), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		auth, id string
+		ok       bool
+	}{
+		{"bob:p@ss:word", "Bob", true},
+		{"BOB:p@ss:word", "Bob", true},
+		{"bob:wrong", "", false},
+		{"old:shared", "legacy", true},
+		{"nobody", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		id, ok := HyAuthCheck(path, c.auth)
+		if ok != c.ok || id != c.id {
+			t.Errorf("%q: %q %v", c.auth, id, ok)
+		}
+	}
+	if _, ok := HyAuthCheck(dir+"/missing.json", "bob:p@ss:word"); ok {
+		t.Fatal("без файла вход запрещён")
 	}
 }
 

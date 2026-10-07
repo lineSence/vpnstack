@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -14,9 +15,10 @@ import (
 	"github.com/lineSence/vpnstack/internal/core"
 	"github.com/lineSence/vpnstack/internal/edge"
 	"github.com/lineSence/vpnstack/internal/module"
-	_ "github.com/lineSence/vpnstack/internal/modules"
+	"github.com/lineSence/vpnstack/internal/modules"
 	"github.com/lineSence/vpnstack/internal/ota"
 	"github.com/lineSence/vpnstack/internal/panel"
+	"github.com/lineSence/vpnstack/internal/state"
 	"github.com/lineSence/vpnstack/internal/stats"
 	"github.com/lineSence/vpnstack/internal/sys"
 	"github.com/lineSence/vpnstack/internal/tui"
@@ -40,6 +42,14 @@ const usage = `vpnstack %s — VPN/прокси-стек на одном сер�
   vpnstack self-update [--check] [--tag vX.Y.Z]
                                    обновить сам vpnstack (подписанные релизы)
   vpnstack panel passwd [пароль] | panel totp on|off | panel url
+  vpnstack adopt scan [--json]     найти сервисы, установленные без vpnstack
+  vpnstack adopt import [svc...|all] [--force]
+                                   считать их настройки и пользователей (ничего не останавливает)
+  vpnstack adopt migrate [svc...|all] [--force] [--no-rollback] [--yes]
+                                   перевести под vpnstack без смены ссылок (автооткат при сбое)
+  vpnstack adopt status | rollback [svc...] | cleanup [svc...]
+  vpnstack route list | add <sni[,sni]> <host:port> [--proxy-protocol] | del <N|sni>
+                                   посторонние сайты за общим входом 443
   vpnstack modules                 список модулей (встроенные и из /etc/vpnstack/modules.d)
   vpnstack doctor                  диагностика
   vpnstack version
@@ -64,6 +74,10 @@ func loadEnv() {
 }
 
 func main() {
+	// Проверка паролей Hysteria 2 (auth type: command) — тот же бинарник под другим именем.
+	if filepath.Base(os.Args[0]) == modules.HyAuthName {
+		os.Exit(modules.HyAuthMain(os.Args[1:]))
+	}
 	loadEnv()
 	if errs := module.LoadExternal(); len(errs) > 0 {
 		for _, e := range errs {
@@ -281,6 +295,10 @@ func run(cmd string, args []string) error {
 			fmt.Printf("%-10s %-26s %-10s %s\n", m.ID(), m.Title(), kind, m.Description())
 		}
 		return nil
+	case "adopt":
+		return adoptCmd(open(), args)
+	case "route", "routes":
+		return routeCmd(open(), args)
 	case "doctor":
 		return doctor(open())
 	case "serve":
@@ -501,4 +519,149 @@ func serve() error {
 	close(stop)
 	time.Sleep(500 * time.Millisecond)
 	return store.Save()
+}
+
+func flags(args []string, names ...string) (map[string]bool, []string) {
+	f := map[string]bool{}
+	var rest []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			ok := false
+			for _, n := range names {
+				if a == n {
+					f[n], ok = true, true
+				}
+			}
+			if !ok {
+				fmt.Fprintf(os.Stderr, "[!] неизвестный флаг %s\n", a)
+				os.Exit(2)
+			}
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return f, rest
+}
+
+func adoptCmd(e *core.Engine, args []string) error {
+	sub := "scan"
+	if len(args) > 0 {
+		sub, args = args[0], args[1:]
+	}
+	switch sub {
+	case "scan":
+		f, _ := flags(args, "--json")
+		r := e.AdoptScan()
+		if f["--json"] {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(r)
+		}
+		tui.AdoptReport(r)
+		return nil
+	case "import":
+		f, ids := flags(args, "--force")
+		msgs, err := e.AdoptImport(ids, f["--force"])
+		for _, m := range msgs {
+			fmt.Println(m)
+		}
+		if err == nil {
+			fmt.Println("Старые установки продолжают работать. Перенос: vpnstack adopt migrate")
+		}
+		return err
+	case "migrate":
+		f, ids := flags(args, "--force", "--no-rollback", "--yes", "-y")
+		if !f["--yes"] && !f["-y"] {
+			fmt.Println(e.MigrateSummary(ids))
+			if !tui.Confirm("Продолжить перенос?") {
+				return fmt.Errorf("отменено")
+			}
+		}
+		return e.AdoptMigrate(ids, core.MigrateOpts{Force: f["--force"], NoRollback: f["--no-rollback"]})
+	case "rollback":
+		return e.AdoptRollback(args)
+	case "cleanup":
+		f, ids := flags(args, "--yes", "-y")
+		if !f["--yes"] && !f["-y"] && !tui.Confirm("Удалить остановленные старые установки? После этого откат невозможен") {
+			return fmt.Errorf("отменено")
+		}
+		return e.AdoptCleanup(ids)
+	case "status", "list":
+		ad := e.Adopted()
+		if len(ad) == 0 {
+			fmt.Println("Перенятых сервисов нет (vpnstack adopt scan)")
+			return nil
+		}
+		var ids []string
+		for id := range ad {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			o := ad[id]
+			fmt.Printf("%-10s %-12s %s\n", id, adoptState(o.State), o.Source)
+			if o.BackupDir != "" {
+				fmt.Printf("           резервная копия: %s\n", o.BackupDir)
+			}
+			for _, w := range o.Warnings {
+				fmt.Printf("           [!] %s\n", w)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("vpnstack adopt scan|import|migrate|status|rollback|cleanup")
+}
+
+func adoptState(s string) string {
+	switch s {
+	case state.OriginImported:
+		return "импортирован"
+	case state.OriginMigrated:
+		return "перенесён"
+	case state.OriginRolledBack:
+		return "откачен"
+	case state.OriginCleaned:
+		return "перенесён, старая удалена"
+	}
+	return s
+}
+
+func routeCmd(e *core.Engine, args []string) error {
+	sub := "list"
+	if len(args) > 0 {
+		sub, args = args[0], args[1:]
+	}
+	switch sub {
+	case "list":
+		if len(e.St.ExtraRoutes) == 0 {
+			fmt.Println("Посторонних маршрутов нет")
+		}
+		for i, r := range e.St.ExtraRoutes {
+			pp := ""
+			if r.ProxyProtocol {
+				pp = " (PROXY protocol)"
+			}
+			fmt.Printf("%d. %s → %s%s %s\n", i+1, strings.Join(r.SNI, ","), r.Backend, pp, r.Note)
+		}
+		if e.St.EdgeMode != "sni" && len(e.St.ExtraRoutes) > 0 {
+			fmt.Println("[!] общий вход выключен (edge_mode=ports) — маршруты не действуют")
+		}
+		return nil
+	case "add":
+		f, rest := flags(args, "--proxy-protocol")
+		if len(rest) < 2 {
+			return fmt.Errorf("vpnstack route add <sni[,sni]> <host:port> [--proxy-protocol] [заметка]")
+		}
+		r := state.Route{SNI: strings.Split(strings.ToLower(rest[0]), ","), Backend: rest[1], ProxyProtocol: f["--proxy-protocol"]}
+		if len(rest) > 2 {
+			r.Note = strings.Join(rest[2:], " ")
+		}
+		return e.AddRoute(r)
+	case "del", "rm", "remove":
+		if len(args) == 0 {
+			return fmt.Errorf("vpnstack route del <номер|sni>")
+		}
+		return e.DelRoute(args[0])
+	}
+	return fmt.Errorf("vpnstack route list|add|del")
 }

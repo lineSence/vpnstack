@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,8 +27,10 @@ type Stack struct {
 	Panel         Panel               `json:"panel"`
 	OTA           OTA                 `json:"ota"`
 	Services      map[string]*Service `json:"services"`
-	Meta          map[string]string   `json:"meta,omitempty"`
-	mu            sync.Mutex
+	// ExtraRoutes — посторонние сайты/сервисы за общим входом (SNI → backend).
+	ExtraRoutes []Route           `json:"extra_routes,omitempty"`
+	Meta        map[string]string `json:"meta,omitempty"`
+	mu          sync.Mutex
 }
 
 // Panel — настройки веб-панели.
@@ -55,6 +59,73 @@ type Service struct {
 	Users       []*User           `json:"users,omitempty"`
 	InstalledAt time.Time         `json:"installed_at,omitempty"`
 	Error       string            `json:"error,omitempty"`
+	// Origin — сервис перенят из существующей установки (vpnstack adopt).
+	Origin *Origin `json:"origin,omitempty"`
+}
+
+// Route — посторонний маршрут общего входа (сайт на другом веб-сервере и т. п.).
+type Route struct {
+	SNI           []string `json:"sni"`
+	Backend       string   `json:"backend"`
+	ProxyProtocol bool     `json:"proxy_protocol,omitempty"`
+	Note          string   `json:"note,omitempty"`
+}
+
+// Состояния перенятого сервиса.
+const (
+	OriginImported   = "imported"    // данные считаны, старая установка работает
+	OriginMigrated   = "migrated"    // работает под vpnstack, старая остановлена (можно откатить)
+	OriginRolledBack = "rolled_back" // откат: снова работает старая установка
+	OriginCleaned    = "cleaned"     // старая установка удалена, откат невозможен
+)
+
+// Origin — откуда перенят сервис и как вернуть всё назад.
+type Origin struct {
+	Kind       string            `json:"kind"`   // systemd | docker | x-ui | amnezia | inplace
+	Source     string            `json:"source"` // человекочитаемое описание
+	Units      []string          `json:"units,omitempty"`
+	Containers []string          `json:"containers,omitempty"`
+	Configs    []string          `json:"configs,omitempty"`
+	Ports      []string          `json:"ports,omitempty"` // tcp/443, udp/443 — порты старой установки
+	Files      map[string]string `json:"files,omitempty"` // назначение → путь (сертификаты, данные)
+	InPlace    bool              `json:"in_place,omitempty"`
+	BackupDir  string            `json:"backup_dir,omitempty"`
+	State      string            `json:"state"`
+	Warnings   []string          `json:"warnings,omitempty"`
+	ImportedAt time.Time         `json:"imported_at"`
+	MigratedAt time.Time         `json:"migrated_at,omitempty"`
+}
+
+// HoldsPort — порт принадлежит старой установке.
+func (o *Origin) HoldsPort(proto string, port int) bool {
+	if o == nil {
+		return false
+	}
+	k := proto + "/" + strconv.Itoa(port)
+	for _, p := range o.Ports {
+		if p == k {
+			return true
+		}
+	}
+	return false
+}
+
+// HasUnit — юнит принадлежит старой установке.
+func (o *Origin) HasUnit(unit string) bool {
+	if o == nil || unit == "" {
+		return false
+	}
+	for _, u := range o.Units {
+		if u == unit {
+			return true
+		}
+	}
+	for _, c := range o.Containers {
+		if strings.HasPrefix(unit, "docker-"+c) {
+			return true
+		}
+	}
+	return false
 }
 
 // User — пользователь (клиент) сервиса.

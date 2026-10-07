@@ -64,6 +64,9 @@ func (c *Caddy) download(env *module.Env) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if haveBin(c.bin(), tag) {
+		return tag, nil
+	}
 	rel, err := sys.ReleaseByTag(caddyRepo, tag)
 	if err != nil {
 		return "", err
@@ -89,7 +92,7 @@ func (c *Caddy) download(env *module.Env) (string, error) {
 	if err := sys.ExtractFile(tmp, "caddy", c.bin()+".new", 0o755); err != nil {
 		return "", err
 	}
-	if err := sys.InstallBinary(c.bin()+".new", c.bin()); err != nil {
+	if err := installBin(c.bin()+".new", c.bin(), tag); err != nil {
 		return "", err
 	}
 	return tag, nil
@@ -224,6 +227,28 @@ func (c *Caddy) Update(env *module.Env, s *state.Service) error {
 		return err
 	}
 	s.Version = tag
+	if err := sys.Systemctl("restart", c.units[0]); err != nil {
+		return err
+	}
+	return waitActive(c.units[0], 20e9)
+}
+
+// Prefetch скачивает Caddy заранее (только если он ещё не установлен — работающий не трогаем).
+func (c *Caddy) Prefetch(env *module.Env, s *state.Service) error {
+	if s.Installed {
+		return nil
+	}
+	_, err := c.download(env)
+	return err
+}
+
+// Rollback возвращает предыдущую версию Caddy.
+func (c *Caddy) Rollback(env *module.Env, s *state.Service, prev string) error {
+	tag, err := restoreBin(c.bin())
+	if err != nil {
+		return err
+	}
+	s.Version = firstNonEmpty(tag, prev)
 	if err := sys.Systemctl("restart", c.units[0]); err != nil {
 		return err
 	}

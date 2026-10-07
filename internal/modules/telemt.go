@@ -41,6 +41,8 @@ func (t *Telemt) Params() []module.Param {
 		{Key: "ad_tag", Label: "ad_tag от @MTProxybot", Type: module.TString, Advanced: true},
 		{Key: "middle_proxy", Label: "Через middle-proxy Telegram", Type: module.TBool, Advanced: true,
 			Help: "Нужно для ad_tag. Выключение — прямое подключение к DC (быстрее)."},
+		{Key: "legacy_tcp", Label: "Старые TCP-порты → общий вход", Type: module.TList, Advanced: true, Restart: true,
+			Help: "Порты прежней установки: перенаправляются на 443, старые ссылки продолжают работать."},
 	}
 }
 
@@ -66,6 +68,7 @@ func (t *Telemt) Needs(env *module.Env, s *state.Service) []module.Need {
 	if env.EdgeEnabled {
 		n = append(n, module.Need{Proto: "tcp", Port: telemtLocal, Purpose: "telemt за общим входом",
 			Edge: &module.EdgeRoute{SNI: []string{s.P("tls_domain")}, Backend: fmt.Sprintf("127.0.0.1:%d", telemtLocal), ProxyProtocol: true, Priority: 60}})
+		n = append(n, legacyNeeds(s, "telemt")...)
 	} else {
 		n = append(n, module.Need{Proto: "tcp", Port: atoi(s.P("port")), Public: true, Param: "port", Purpose: "telemt"})
 	}
@@ -87,6 +90,9 @@ func (t *Telemt) download(env *module.Env) (string, error) {
 	tag, err := t.Latest(env)
 	if err != nil {
 		return "", err
+	}
+	if haveBin(t.bin(), tag) {
+		return tag, nil
 	}
 	rel, err := sys.ReleaseByTag(telemtRepo, tag)
 	if err != nil {
@@ -117,7 +123,7 @@ func (t *Telemt) download(env *module.Env) (string, error) {
 	if err := sys.ExtractFile(tmp, "telemt", t.bin()+".new", 0o755); err != nil {
 		return "", err
 	}
-	return tag, sys.InstallBinary(t.bin()+".new", t.bin())
+	return tag, installBin(t.bin()+".new", t.bin(), tag)
 }
 
 func (t *Telemt) cfgPath() string { return filepath.Join(t.cfgDir(), "telemt.toml") }
@@ -157,6 +163,10 @@ func (t *Telemt) render(env *module.Env, s *state.Service) string {
 	b.WriteString("\n[access.users]\n")
 	for _, u := range s.Users {
 		fmt.Fprintf(&b, "%s = %s\n", tq(u.Name), tq(u.Data["secret"]))
+	}
+	// Перенятые лимиты/квоты пользователей ([access.user_*]) — как были.
+	if v := strings.TrimSpace(s.P("access_extra")); v != "" {
+		b.WriteString("\n" + v + "\n")
 	}
 	return b.String()
 }
@@ -237,13 +247,29 @@ func (t *Telemt) Update(env *module.Env, s *state.Service) error {
 	return t.Apply(env, s)
 }
 
+// Prefetch скачивает telemt заранее.
+func (t *Telemt) Prefetch(env *module.Env, s *state.Service) error {
+	_, err := t.download(env)
+	return err
+}
+
+// Rollback возвращает предыдущую версию telemt.
+func (t *Telemt) Rollback(env *module.Env, s *state.Service, prev string) error {
+	tag, err := restoreBin(t.bin())
+	if err != nil {
+		return err
+	}
+	s.Version = firstNonEmpty(tag, prev)
+	return t.Apply(env, s)
+}
+
 func (t *Telemt) ConfigFiles(*state.Service) []string { return []string{t.cfgPath()} }
 
 func (t *Telemt) AddUser(env *module.Env, s *state.Service, name string, opts map[string]string) (*state.User, error) {
 	u := &state.User{Name: name, Data: map[string]string{"secret": sys.RandHex(16)}}
 	s.Users = append(s.Users, u)
 	if s.Installed {
-		if err := t.Apply(env, s); err != nil {
+		if err := t.reload(env, s); err != nil {
 			s.RemoveUser(name)
 			return nil, err
 		}
@@ -255,7 +281,19 @@ func (t *Telemt) DelUser(env *module.Env, s *state.Service, name string) error {
 	if !s.RemoveUser(name) {
 		return fmt.Errorf("нет пользователя %s", name)
 	}
-	return t.Apply(env, s)
+	return t.reload(env, s)
+}
+
+// reload — пользователи и квоты telemt применяются на лету (hot reload по inotify/SIGHUP),
+// без разрыва соединений остальных.
+func (t *Telemt) reload(env *module.Env, s *state.Service) error {
+	if err := t.write(env, s); err != nil {
+		return err
+	}
+	if !sys.Active(t.units[0]) {
+		return t.Apply(env, s)
+	}
+	return sys.Systemctl("kill", "-s", "HUP", t.units[0])
 }
 
 // Artifacts — ссылка fake-TLS: секрет = "ee" + 16 байт + домен в hex.

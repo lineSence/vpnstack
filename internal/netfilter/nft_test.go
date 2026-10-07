@@ -13,3 +13,10 @@ func TestRender(t *testing.T) {
 		}
 	}
 }
+
+func TestRedirect(t *testing.T) {
+	out := Render(Spec{Redirect: []int{8443, 2053}, EdgePort: 443})
+	if !strings.Contains(out, "fib daddr type local tcp dport { 2053, 8443 } redirect to :443") {
+		t.Fatal(out)
+	}
+}

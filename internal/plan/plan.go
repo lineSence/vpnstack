@@ -98,6 +98,16 @@ func Build(env *module.Env, st *state.Stack, listeners []sys.Listener) Result {
 			}
 		}
 	}
+	// Посторонние маршруты (сайты других веб-серверов за общим входом).
+	if env.EdgeEnabled {
+		for i, x := range st.ExtraRoutes {
+			r.Routes = append(r.Routes, module.EdgeRoute{Name: fmt.Sprintf("extra%d", i+1), SNI: x.SNI,
+				Backend: x.Backend, ProxyProtocol: x.ProxyProtocol, Priority: 40})
+			for _, s := range x.SNI {
+				claimed[s] = true
+			}
+		}
+	}
 	r.NeedEdge = env.EdgeEnabled && (len(r.Routes) > 0 || r.NeedCaddy)
 	for _, core := range []struct {
 		id   string

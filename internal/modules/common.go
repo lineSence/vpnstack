@@ -331,3 +331,51 @@ func publicPort(env *module.Env, s *state.Service, key string) int {
 	}
 	return atoi(s.P(key))
 }
+
+func firstNonEmpty(v ...string) string {
+	for _, x := range v {
+		if x != "" {
+			return x
+		}
+	}
+	return ""
+}
+
+// certValidFor — сертификат в файле подходит для домена и действует ещё не меньше left.
+func certValidFor(path, domain string, left time.Duration) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return false
+	}
+	c, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		return false
+	}
+	return c.VerifyHostname(domain) == nil && time.Until(c.NotAfter) > left
+}
+
+// legacyNeeds — старые публичные TCP-порты перенятой установки: nftables перенаправляет
+// их на общий вход 443, а тот разбирает соединения по SNI как обычно.
+func legacyNeeds(s *state.Service, what string) []module.Need {
+	var n []module.Need
+	for _, p := range list(s, "legacy_tcp") {
+		if port := atoi(p); port > 0 && port != 443 {
+			n = append(n, module.Need{Proto: "tcp", Port: port, Public: true, Redirect: true,
+				Purpose: what + ": старый порт → общий вход 443"})
+		}
+	}
+	return n
+}
+
+// EnsureUser — системный пользователь для сервиса (нужен ядру при переносе файлов).
+func EnsureUser(name string) { ensureUser(name) }
+
+// CaddyStorageDir — хранилище сертификатов Caddy стека (certmagic).
+func CaddyStorageDir() string { return filepath.Join(DataDir, "caddy", "caddy") }
+
+// HysteriaCertPaths — куда модуль hysteria кладёт сертификат и ключ.
+func HysteriaCertPaths() (string, string) { return (&Hysteria{base{id: "hysteria"}}).certPaths() }
