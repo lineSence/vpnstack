@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -119,8 +122,25 @@ func (h *Hysteria) certPaths() (string, string) {
 
 // syncCert копирует сертификат из Caddy (или создаёт самоподписанный).
 // Hysteria перечитывает файлы сертификата сама — перезапуск не нужен.
-func (h *Hysteria) syncCert(env *module.Env, s *state.Service, wait time.Duration) error {
+func (h *Hysteria) syncCert(env *module.Env, s *state.Service, wait time.Duration) (err error) {
 	cert, key := h.certPaths()
+	// Fix permissions on every successful path, including an adopted certificate
+	// or an unchanged copy. Atomic replacement also resets group ownership.
+	defer func() {
+		if err == nil {
+			group, lookupErr := user.LookupGroup("hysteria")
+			if lookupErr != nil {
+				err = fmt.Errorf("Hysteria TLS group: %w", lookupErr)
+				return
+			}
+			gid, parseErr := strconv.Atoi(group.Gid)
+			if parseErr != nil {
+				err = fmt.Errorf("Hysteria TLS gid: %w", parseErr)
+				return
+			}
+			err = hysteriaTLSPermissions(cert, key, gid)
+		}
+	}()
 	d := s.P("domain")
 	if d == "" {
 		if !sys.Exists(cert) || s.Secrets["self_signed"] != "true" {
@@ -131,7 +151,6 @@ func (h *Hysteria) syncCert(env *module.Env, s *state.Service, wait time.Duratio
 			s.Secrets["self_signed"] = "true"
 			s.Secrets["pin_sha256"] = fp
 		}
-		_, _ = sys.Run("chgrp", "hysteria", key)
 		return nil
 	}
 	delete(s.Secrets, "self_signed")
@@ -144,19 +163,34 @@ func (h *Hysteria) syncCert(env *module.Env, s *state.Service, wait time.Duratio
 			if _, err := copyIfChanged(k, key, 0o640); err != nil {
 				return err
 			}
-			_, _ = sys.Run("chgrp", "hysteria", key)
 			return nil
 		}
 		if time.Now().After(deadline) || (wait > 0 && certValidFor(cert, d, 72*time.Hour)) {
 			if certValidFor(cert, d, 72*time.Hour) {
 				// Перенос: пока Caddy получает свой сертификат, работаем на перенятом.
-				_, _ = sys.Run("chgrp", "hysteria", key)
 				return nil
 			}
 			return fmt.Errorf("Caddy не выпустил сертификат для %s: проверьте A-запись и доступность TCP 80/443 (journalctl -u vpnstack-caddy)", d)
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// hysteriaTLSPermissions keeps the private key inaccessible to other users,
+// while making both TLS files readable by the service's group.
+func hysteriaTLSPermissions(cert, key string, gid int) error {
+	for _, file := range []struct {
+		path string
+		mode os.FileMode
+	}{{cert, 0o644}, {key, 0o640}} {
+		if err := os.Chown(file.path, -1, gid); err != nil {
+			return fmt.Errorf("Hysteria TLS group %s: %w", file.path, err)
+		}
+		if err := os.Chmod(file.path, file.mode); err != nil {
+			return fmt.Errorf("Hysteria TLS mode %s: %w", file.path, err)
+		}
+	}
+	return nil
 }
 
 // Tick вызывается сервисом vpnstack периодически: подхватывает продлённый сертификат.
@@ -220,7 +254,9 @@ func (h *Hysteria) Install(env *module.Env, s *state.Service) error {
 		return err
 	}
 	s.Version = tag
-	_, _ = sys.Run("install", "-d", "-m", "0750", "-g", "hysteria", h.cfgDir())
+	if _, err := sys.Run("install", "-d", "-m", "0750", "-g", "hysteria", h.cfgDir()); err != nil {
+		return fmt.Errorf("Hysteria config directory: %w", err)
+	}
 	if err := h.syncCert(env, s, 3*time.Minute); err != nil {
 		return err
 	}
