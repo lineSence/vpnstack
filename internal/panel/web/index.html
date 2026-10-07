@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vpnstack</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card">
+    <h1>vpnstack</h1>
+    <label>Логин <input name="login" autocomplete="username" required></label>
+    <label>Пароль <input name="password" type="password" autocomplete="current-password" required></label>
+    <label>Код 2FA (если включён) <input name="totp" inputmode="numeric" autocomplete="one-time-code"></label>
+    <button type="submit">Войти</button>
+    <p class="err" id="loginErr"></p>
+  </form>
+</div>
+<div id="app" class="hidden">
+  <header>
+    <b>vpnstack</b>
+    <nav>
+      <a href="#overview" data-tab="overview">Обзор</a>
+      <a href="#services" data-tab="services">Сервисы</a>
+      <a href="#jobs" data-tab="jobs">Задачи</a>
+      <a href="#settings" data-tab="settings">Настройки</a>
+    </nav>
+    <span id="ver" class="muted"></span>
+    <button id="logout" class="link">Выйти</button>
+  </header>
+  <main id="main"></main>
+</div>
+<div id="modal" class="modal hidden"><div class="modal-body card"><button class="close link" id="modalClose">✕</button><div id="modalContent"></div></div></div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Test
+        run: go vet ./... && go test ./...
+      - name: Build
+        env:
+          PUBKEY: ${{ vars.VPNSTACK_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          commit="$(git rev-parse --short HEAD)"
+          pkg=github.com/lineSence/vpnstack/internal/version
+          mkdir dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X $pkg.Version=$tag -X $pkg.Commit=$commit -X $pkg.SigningKey=$PUBKEY" \
+              -o dist/vpnstack-linux-$arch ./cmd/vpnstack
+          done
+          cp install.sh dist/
+          (cd dist && sha256sum vpnstack-linux-* install.sh > SHA256SUMS)
+      - name: Sign
+        env:
+          VPNSTACK_SIGNING_KEY: ${{ secrets.VPNSTACK_SIGNING_KEY }}
+        run: |
+          if [ -n "$VPNSTACK_SIGNING_KEY" ]; then
+            go run ./cmd/vpnstack-sign sign dist/SHA256SUMS
+          else
+            echo "::warning::VPNSTACK_SIGNING_KEY не задан — релиз без подписи, OTA его не примет"
+          fi
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --generate-notes $flags
