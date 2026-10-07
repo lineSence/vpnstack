@@ -55,12 +55,19 @@ func (t *TGWP) AutoDefaults(env *module.Env, s *state.Service) error {
 }
 
 func (t *TGWP) Needs(env *module.Env, s *state.Service) []module.Need {
-	return []module.Need{
+	needs := []module.Need{
 		{Proto: "tcp", Port: 8080, Purpose: "tproxy-server"},
 		{Proto: "tcp", Port: 8081, Purpose: "tproxy-server admin"},
-		{Proto: "tcp", Port: 2398, Purpose: "MTProxy backend"},
-		{Proto: "tcp", Port: 8888, Purpose: "MTProxy stats"},
 	}
+	// An in-place adoption does not run the installer or change MTProxy's
+	// listeners. Its existing backend/stats ports need not be installer defaults
+	// (8888 may belong to another application). Check readiness via Status instead.
+	if s.P("adopted_inplace") != "true" {
+		needs = append(needs,
+			module.Need{Proto: "tcp", Port: 2398, Purpose: "MTProxy backend"},
+			module.Need{Proto: "tcp", Port: 8888, Purpose: "MTProxy stats"})
+	}
+	return needs
 }
 
 // CaddySites — сайт домена целиком проксируется в tproxy-server (как в штатном Caddyfile).

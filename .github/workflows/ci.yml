@@ -15,5 +15,10 @@ jobs:
           go-version: stable
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --check internal/panel/web/app.js
+      - run: node --test tests/panel-adopt.test.cjs
       - run: go test ./...
       - run: CGO_ENABLED=0 go build ./cmd/...
