@@ -66,7 +66,7 @@ UDP x    → AmneziaWG (случайный порт 30000–60000)
 | `tgwp` | TG WEB proxy (tproxy-server + MTProxy) | TCP 443 через Caddy | одна ссылка | `t.me/webproxy?...` | — |
 | `telemt` | MTProto-прокси telemt | TCP 443 по SNI | да | `tg://proxy?...` (ee-секрет) | сумма rx+tx |
 | `xray` | VLESS + REALITY + Vision | TCP 443 по SNI | да | `vless://...` | да |
-| `awg` | AmneziaWG 2.0 / 1.5 | UDP случайный | да | `.conf` + QR | да |
+| `awg` | AmneziaWG 3.1 (3.0 / 2.0 / 1.5) | UDP случайный | да | `.conf` + QR | да |
 | `hysteria` | Hysteria 2 | UDP 443 | да | `hysteria2://...` | да |
 
 Для доменов нужны A-записи на сервер (поддомены: `tg.`, `hy.`, `mt.` и т. п.). Без домена Hysteria работает
@@ -134,6 +134,6 @@ vpnstack remove <svc> [--purge]
   из него вырезается только установка собственного Caddy (проверено на ревизии `c8adb8b`; на другой ревизии
   установка остановится с понятной ошибкой).
 * **AmneziaWG**: модуль ядра из PPA `amnezia/ppa`; если не собрался — userspace `amneziawg-go` из исходников.
-  Режим 2.0 (диапазоны H1–H4, S3/S4) требует свежих клиентов AmneziaVPN/AmneziaWG; для старых — `awg_version=1.5`.
+  По умолчанию AWG 3.1 (HeaderProtectionKey, ContentPaddingAddition, RandomTrailers) — нужны клиенты с поддержкой AWG 3 (AmneziaVPN 5.0+). Для старых клиентов — `awg_version=2.0` или `1.5`.
 * SNI разных сервисов на общем входе не должны пересекаться (с учётом поддоменов) — `vpnstack plan` это проверяет.
 * Перезапуск Xray/Hysteria/telemt при изменении пользователей кратко рвёт текущие соединения этого сервиса.

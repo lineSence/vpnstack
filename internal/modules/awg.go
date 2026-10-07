@@ -24,7 +24,7 @@ const (
 
 func init() {
 	module.Register(&AWG{base{id: "awg", title: "AmneziaWG", order: 50,
-		desc:  "WireGuard с обфускацией заголовков и мусорными пакетами (AmneziaWG 1.5/2.0)",
+		desc:  "WireGuard с обфускацией заголовков и мусорными пакетами (AmneziaWG 3.1, совместимость с 3.0/2.0/1.5)",
 		units: []string{"awg-quick@" + awgIface + ".service"}}})
 }
 
@@ -33,8 +33,9 @@ func (a *AWG) Params() []module.Param {
 		{Key: "port", Label: "UDP-порт", Type: module.TPort, Restart: true},
 		{Key: "subnet", Label: "Подсеть клиентов", Type: module.TString, Advanced: true, Restart: true},
 		{Key: "dns", Label: "DNS для клиентов", Type: module.TList},
-		{Key: "awg_version", Label: "Версия протокола", Type: module.TSelect, Options: []string{"2.0", "1.5"}, Restart: true,
-			Help: "2.0 — диапазоны H1–H4 и паддинги S3/S4 (нужны свежие клиенты AmneziaVPN/AmneziaWG); 1.5 — совместимость со старыми клиентами."},
+		{Key: "awg_version", Label: "Версия протокола", Type: module.TSelect, Options: []string{"3.1", "3.0", "2.0", "1.5"}, Restart: true,
+			Help: "3.1 — защита заголовков (HeaderProtectionKey), паддинг содержимого и случайные хвосты пакетов; нужны клиенты с поддержкой AWG 3 (AmneziaVPN 5.0+, свежие AmneziaWG). " +
+				"3.0 — то же без случайных хвостов. 2.0 — диапазоны H1–H4 и S3/S4. 1.5 — для старых клиентов. Смена версии требует раздать всем клиентам новые конфиги."},
 		{Key: "mtu", Label: "MTU", Type: module.TInt, Advanced: true},
 		{Key: "jc", Label: "Jc", Type: module.TInt, Advanced: true, Restart: true},
 		{Key: "jmin", Label: "Jmin", Type: module.TInt, Advanced: true, Restart: true},
@@ -47,6 +48,11 @@ func (a *AWG) Params() []module.Param {
 		{Key: "h2", Label: "H2", Type: module.TString, Advanced: true, Restart: true},
 		{Key: "h3", Label: "H3", Type: module.TString, Advanced: true, Restart: true},
 		{Key: "h4", Label: "H4", Type: module.TString, Advanced: true, Restart: true},
+		{Key: "content_padding", Label: "ContentPaddingAddition (AWG 3+)", Type: module.TString, Advanced: true, Restart: true,
+			Help: "Диапазон дополнительного паддинга данных, например 0-32. Пусто — выключено."},
+		{Key: "random_trailers", Label: "RandomTrailers (AWG 3.1)", Type: module.TBool, Advanced: true, Restart: true},
+		{Key: "disable_cookies", Label: "DisableCookies (AWG 3.1, только сервер)", Type: module.TBool, Advanced: true, Restart: true,
+			Help: "Сервер не отправляет cookie-ответы (ещё один узнаваемый тип пакета), ценой защиты от handshake-флуда."},
 		{Key: "i1", Label: "I1 (сигнатурный пакет, необязательно)", Type: module.TString, Advanced: true, Restart: true,
 			Help: "Например <b 0x...><r 16> — имитация первого пакета другого протокола. Пусто — не используется."},
 	}
@@ -66,7 +72,7 @@ func (a *AWG) AutoDefaults(env *module.Env, s *state.Service) error {
 		}
 	}
 	s.Default("dns", "1.1.1.1, 1.0.0.1")
-	s.Default("awg_version", "2.0")
+	s.Default("awg_version", "3.1")
 	s.Default("mtu", "1280")
 	s.Default("jc", itoa(randInt(4, 12)))
 	s.Default("jmin", "8")
@@ -92,6 +98,23 @@ func (a *AWG) AutoDefaults(env *module.Env, s *state.Service) error {
 				v = itoa(from)
 			}
 			s.Default(fmt.Sprintf("h%d", i+1), v)
+		}
+	}
+	if awgMajor(s) >= 3 {
+		s.Default("content_padding", "0-"+itoa(randInt(16, 48)))
+		if s.P("awg_version") == "3.1" {
+			s.Default("random_trailers", "true")
+		}
+		s.Default("disable_cookies", "false")
+		s.Secret("header_protection_key", func() string {
+			p, _ := x25519()
+			return base64.StdEncoding.EncodeToString(p)
+		})
+		// Защита заголовков использует паддинги S1–S4 как nonce: каждый должен быть ≥ 12.
+		for _, k := range []string{"s1", "s2", "s3", "s4"} {
+			if atoi(s.P(k)) < 12 {
+				return fmt.Errorf("AmneziaWG %s: %s должен быть не меньше 12", s.P("awg_version"), strings.ToUpper(k))
+			}
 		}
 	}
 	s.Secret("private_key", func() string {
@@ -203,7 +226,15 @@ func (a *AWG) serverAddr(s *state.Service) (string, *net.IPNet) {
 	return fmt.Sprintf("%s/%d", gw, ones), n
 }
 
-func (a *AWG) obf(s *state.Service) string {
+// awgMajor — мажорная версия протокола (1 для 1.5).
+func awgMajor(s *state.Service) int {
+	v, _, _ := strings.Cut(s.P("awg_version"), ".")
+	return atoi(v)
+}
+
+// obf — параметры обфускации для секции [Interface]. server — конфиг сервера
+// (DisableCookies нужен только там).
+func (a *AWG) obf(s *state.Service, server bool) string {
 	var b strings.Builder
 	for _, k := range []string{"jc", "jmin", "jmax", "s1", "s2"} {
 		fmt.Fprintf(&b, "%s = %s\n", strings.ToUpper(k[:1])+k[1:], s.P(k))
@@ -217,6 +248,18 @@ func (a *AWG) obf(s *state.Service) string {
 	if v := s.P("i1"); v != "" {
 		fmt.Fprintf(&b, "I1 = %s\n", v)
 	}
+	if awgMajor(s) >= 3 {
+		fmt.Fprintf(&b, "HeaderProtectionKey = %s\n", s.Secrets["header_protection_key"])
+		if v := s.P("content_padding"); v != "" {
+			fmt.Fprintf(&b, "ContentPaddingAddition = %s\n", v)
+		}
+		if s.P("awg_version") != "3.0" && s.P("random_trailers") == "true" {
+			b.WriteString("RandomTrailers = true\n")
+		}
+		if server && s.P("awg_version") != "3.0" && s.P("disable_cookies") == "true" {
+			b.WriteString("DisableCookies = true\n")
+		}
+	}
 	return b.String()
 }
 
@@ -224,7 +267,7 @@ func (a *AWG) render(s *state.Service) string {
 	addr, _ := a.serverAddr(s)
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Сгенерировано vpnstack\n[Interface]\nPrivateKey = %s\nAddress = %s\nListenPort = %s\nMTU = %s\n%s",
-		s.Secrets["private_key"], addr, s.P("port"), s.P("mtu"), a.obf(s))
+		s.Secrets["private_key"], addr, s.P("port"), s.P("mtu"), a.obf(s, true))
 	for _, u := range s.Users {
 		fmt.Fprintf(&b, "\n# %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n", u.Name, u.Data["public_key"], u.Data["psk"], u.Data["ip"])
 	}
@@ -337,7 +380,7 @@ func (a *AWG) Artifacts(env *module.Env, s *state.Service, u *state.User) ([]mod
 		return nil, err
 	}
 	conf := fmt.Sprintf("[Interface]\nPrivateKey = %s\nAddress = %s/32\nDNS = %s\nMTU = %s\n%s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s:%s\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n",
-		u.Data["private_key"], u.Data["ip"], s.P("dns"), s.P("mtu"), a.obf(s), spub, u.Data["psk"], env.Stack.PublicIP, s.P("port"))
+		u.Data["private_key"], u.Data["ip"], s.P("dns"), s.P("mtu"), a.obf(s, false), spub, u.Data["psk"], env.Stack.PublicIP, s.P("port"))
 	return []module.Artifact{{Kind: "file", Title: "Конфигурация AmneziaWG (AmneziaVPN / AmneziaWG — импорт файла или QR)", Name: safeName(u.Name) + ".conf", Value: conf, QR: true}}, nil
 }
 

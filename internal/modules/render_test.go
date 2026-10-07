@@ -85,7 +85,7 @@ func TestAWG(t *testing.T) {
 		t.Fatalf("адреса: %s %s", u1.Data["ip"], u2.Data["ip"])
 	}
 	conf := a.render(s)
-	for _, want := range []string{"Address = 10.66.66.1/24", "ListenPort = 51820", "Jc = ", "S3 = ", "H1 = ", "# u2"} {
+	for _, want := range []string{"Address = 10.66.66.1/24", "ListenPort = 51820", "Jc = ", "S3 = ", "H1 = ", "HeaderProtectionKey = ", "ContentPaddingAddition = 0-", "RandomTrailers = true", "# u2"} {
 		if !strings.Contains(conf, want) {
 			t.Errorf("нет %q:\n%s", want, conf)
 		}
@@ -96,6 +96,14 @@ func TestAWG(t *testing.T) {
 	arts, err := a.Artifacts(env, s, u1)
 	if err != nil || !strings.Contains(arts[0].Value, "Endpoint = 203.0.113.1:51820") {
 		t.Fatalf("клиент: %v %v", err, arts)
+	}
+	if !strings.Contains(arts[0].Value, "HeaderProtectionKey = "+s.Secrets["header_protection_key"]) || strings.Contains(arts[0].Value, "DisableCookies") {
+		t.Fatalf("клиент без параметров AWG 3: %s", arts[0].Value)
+	}
+	old := &state.Service{Params: map[string]string{"subnet": "10.66.66.0/24", "port": "51820", "awg_version": "2.0"}}
+	_ = a.AutoDefaults(env, old)
+	if strings.Contains(a.render(old), "HeaderProtectionKey") {
+		t.Fatal("AWG 2.0 не должен получать параметры 3.x")
 	}
 	pub, _ := wgPub(u1.Data["private_key"])
 	if pub != u1.Data["public_key"] {

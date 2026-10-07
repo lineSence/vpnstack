@@ -64,11 +64,14 @@
 
 * Установка: `add-apt-repository ppa:amnezia/ppa`, `linux-headers-$(uname -r)`, `apt install amneziawg`;
   интерфейс `awgvs0`, конфиг `/etc/amnezia/amneziawg/awgvs0.conf`, юнит `awg-quick@awgvs0`.
-* Параметры: `Jc` 4–12, `Jmin 8`, `Jmax 80`, `S1`/`S2` 15–150 с `S1 + 56 ≠ S2`, `S3`/`S4` (2.0),
+* Версия протокола по умолчанию — **3.1** (`amneziawg-tools`/`amneziawg-go` v3.1, kmod в PPA с поддержкой 3.1).
+  AWG 3.0: `HeaderProtectionKey` (общий для сервера и клиентов, требует S1–S4 ≥ 12), `ContentPaddingAddition` (диапазон).
+  AWG 3.1: `RandomTrailers` (обе стороны), `DisableCookies` (только сервер, по умолчанию выключен).
+  Клиенты: AmneziaVPN 5.0+ (AWG 3), для старых клиентов — `awg_version` 2.0 или 1.5.
+* Параметры: `Jc` 4–12, `Jmin 8`, `Jmax 80`, `S1`/`S2` 15–150 с `S1 + 56 ≠ S2`, `S3`/`S4` (2.0+),
   `H1–H4` — непересекающиеся диапазоны в 5…2147483647 (2.0) или одиночные значения (1.5), `I1` — необязательная сигнатура.
 * Пиры добавляются без разрыва: `awg syncconf awgvs0 <(awg-quick strip awgvs0)`; трафик — `awg show awgvs0 dump`.
 * NAT — `masquerade` в таблице `inet vpnstack`, `net.ipv4.ip_forward = 1`.
-* AWG 3 (Header Protection) пока не включается: требует S1–S4 ≥ 12 и поддержки клиентами.
 
 ## FPTN
 
