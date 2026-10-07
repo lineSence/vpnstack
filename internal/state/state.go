@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lineSence/vpnstack/internal/sys"
@@ -31,6 +32,11 @@ type Stack struct {
 	ExtraRoutes []Route           `json:"extra_routes,omitempty"`
 	Meta        map[string]string `json:"meta,omitempty"`
 	mu          sync.Mutex
+	// Отпечаток файла после последней загрузки/записи этим процессом: так видно, что
+	// файл изменил другой процесс (например, `vpnstack panel passwd` при работающей панели).
+	fileMod  time.Time
+	fileSize int64
+	fileIno  uint64
 }
 
 // Panel — настройки веб-панели.
@@ -209,7 +215,75 @@ func Load() (*Stack, error) {
 	if st.Services == nil {
 		st.Services = map[string]*Service{}
 	}
+	st.stamp()
 	return st, nil
+}
+
+func (st *Stack) stamp() {
+	if fi, err := os.Stat(Path); err == nil {
+		st.fileMod, st.fileSize, st.fileIno = fi.ModTime(), fi.Size(), inode(fi)
+	}
+}
+
+// inode: запись атомарная (новый файл + rename), поэтому новый inode = новая версия.
+func inode(fi os.FileInfo) uint64 {
+	if s, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return s.Ino
+	}
+	return 0
+}
+
+// Changed — файл состояния изменён другим процессом после нашей загрузки/записи.
+func (st *Stack) Changed() bool {
+	fi, err := os.Stat(Path)
+	if err != nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return !fi.ModTime().Equal(st.fileMod) || fi.Size() != st.fileSize || inode(fi) != st.fileIno
+}
+
+// Reload перечитывает файл в тот же объект (на него ссылаются модули и панель).
+func (st *Stack) Reload() error {
+	n, err := Load()
+	if err != nil {
+		return err
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.SchemaVersion, st.PublicIP, st.ExtraIPs, st.Email = n.SchemaVersion, n.PublicIP, n.ExtraIPs, n.Email
+	st.EdgeMode, st.Channel, st.Panel, st.OTA = n.EdgeMode, n.Channel, n.Panel, n.OTA
+	st.Services, st.ExtraRoutes, st.Meta = n.Services, n.ExtraRoutes, n.Meta
+	st.fileMod, st.fileSize, st.fileIno = n.fileMod, n.fileSize, n.fileIno
+	return nil
+}
+
+// ReadPanel — учётные данные панели прямо из файла (для входа, пока идёт длинная операция).
+func ReadPanel() (Panel, error) {
+	n, err := Load()
+	if err != nil {
+		return Panel{}, err
+	}
+	return n.Panel, nil
+}
+
+// FileLock — блокировка состояния между процессами vpnstack (панель, CLI, меню).
+// wait=false — не ждать (вернёт ok=false, если занято).
+func FileLock(wait bool) (unlock func(), ok bool) {
+	f, err := os.OpenFile(Path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return func() {}, true // нет каталога (тесты, первый запуск) — без блокировки
+	}
+	how := syscall.LOCK_EX
+	if !wait {
+		how |= syscall.LOCK_NB
+	}
+	if err := syscall.Flock(int(f.Fd()), how); err != nil {
+		f.Close()
+		return nil, false
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, true
 }
 
 // Save атомарно сохраняет состояние (права 0600 — внутри секреты).
@@ -221,7 +295,17 @@ func (st *Stack) Save() error {
 		return err
 	}
 	_ = sys.Backup(Path)
-	return sys.WriteFileAtomic(Path, b, 0o600)
+	if err := sys.WriteFileAtomic(Path, b, 0o600); err != nil {
+		return err
+	}
+	st.stampLocked()
+	return nil
+}
+
+func (st *Stack) stampLocked() {
+	if fi, err := os.Stat(Path); err == nil {
+		st.fileMod, st.fileSize, st.fileIno = fi.ModTime(), fi.Size(), inode(fi)
+	}
 }
 
 // Svc возвращает состояние сервиса, создавая его при необходимости.

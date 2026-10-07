@@ -29,10 +29,11 @@ const Self = "/usr/local/bin/vpnstack"
 
 // Engine — движок; все изменяющие операции сериализуются.
 type Engine struct {
-	mu   sync.Mutex
-	St   *state.Stack
-	Env  *module.Env
-	last plan.Result
+	mu     sync.Mutex
+	unlock func() // блокировка файла состояния (между процессами)
+	St     *state.Stack
+	Env    *module.Env
+	last   plan.Result
 }
 
 // Open загружает состояние.
@@ -61,16 +62,84 @@ func Open() (*Engine, error) {
 	return e, nil
 }
 
-// Lock/Unlock — для длинных операций снаружи (задачи панели).
-func (e *Engine) Lock()   { e.mu.Lock() }
-func (e *Engine) Unlock() { e.mu.Unlock() }
+// Lock/Unlock — для операций снаружи (панель, CLI). Блокировка общая для всех процессов
+// vpnstack; перед работой состояние перечитывается, если его изменил другой процесс —
+// иначе долго работающая панель затирала бы изменения из CLI (например, новый пароль).
+func (e *Engine) Lock() {
+	e.mu.Lock()
+	unlock, ok := state.FileLock(false)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "ожидаю завершения другой операции vpnstack…")
+		unlock, _ = state.FileLock(true)
+	}
+	e.unlock = unlock
+	e.sync()
+}
+
+func (e *Engine) Unlock() {
+	if e.unlock != nil {
+		e.unlock()
+		e.unlock = nil
+	}
+	e.mu.Unlock()
+}
+
+// tryLock — без ожидания; false, если занято (в этом или другом процессе).
+func (e *Engine) tryLock() bool {
+	if !e.mu.TryLock() {
+		return false
+	}
+	unlock, ok := state.FileLock(false)
+	if !ok {
+		e.mu.Unlock()
+		return false
+	}
+	e.unlock = unlock
+	e.sync()
+	return true
+}
+
+func (e *Engine) sync() {
+	if e.St.Changed() {
+		if err := e.St.Reload(); err != nil {
+			fmt.Fprintln(os.Stderr, "перечитать состояние:", err)
+			return
+		}
+		e.refresh()
+	}
+}
 
 // TryRun выполняет fn, если движок не занят длинной операцией.
 func (e *Engine) TryRun(fn func()) {
-	if e.mu.TryLock() {
-		defer e.mu.Unlock()
+	if e.tryLock() {
+		defer e.Unlock()
 		fn()
 	}
+}
+
+// Mutate — изменить состояние под блокировкой и сохранить.
+func (e *Engine) Mutate(fn func(st *state.Stack) error) error {
+	e.Lock()
+	defer e.Unlock()
+	if err := fn(e.St); err != nil {
+		return err
+	}
+	e.refresh()
+	return e.St.Save()
+}
+
+// PanelAuth — учётные данные панели, актуальные даже во время длинной операции.
+func (e *Engine) PanelAuth() state.Panel {
+	if e.tryLock() {
+		defer e.Unlock()
+		return e.St.Panel
+	}
+	if e.St.Changed() {
+		if p, err := state.ReadPanel(); err == nil {
+			return p
+		}
+	}
+	return e.St.Panel
 }
 
 func (e *Engine) refresh() {
@@ -132,8 +201,8 @@ func (e *Engine) Prepare(id string, params map[string]string) (plan.Result, erro
 
 // Install ставит (или переустанавливает) сервис.
 func (e *Engine) Install(id string, params map[string]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	if err := e.Init(); err != nil {
 		return err
 	}
@@ -177,8 +246,8 @@ func (e *Engine) Install(id string, params map[string]string) error {
 
 // Reconfigure меняет параметры установленного сервиса и применяет их.
 func (e *Engine) Reconfigure(id string, params map[string]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	m, err := mod(id)
 	if err != nil {
 		return err
@@ -214,8 +283,8 @@ func (e *Engine) Reconfigure(id string, params map[string]string) error {
 
 // Remove удаляет сервис; purge — вместе с данными, пользователями и настройками.
 func (e *Engine) Remove(id string, purge bool) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	m, err := mod(id)
 	if err != nil {
 		return err
@@ -244,8 +313,8 @@ func (e *Engine) Restart(id string) error {
 
 // Update ставит последнюю версию сервиса.
 func (e *Engine) Update(id string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	m, err := mod(id)
 	if err != nil {
 		return err
@@ -283,8 +352,8 @@ func (e *Engine) Update(id string) error {
 
 // AddRoute добавляет посторонний сайт/сервис за общим входом 443 (по SNI).
 func (e *Engine) AddRoute(r state.Route) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	if len(r.SNI) == 0 || r.Backend == "" {
 		return fmt.Errorf("нужны SNI и адрес backend (host:port)")
 	}
@@ -306,8 +375,8 @@ func (e *Engine) AddRoute(r state.Route) error {
 
 // DelRoute удаляет посторонний маршрут по номеру (с 1) или SNI.
 func (e *Engine) DelRoute(key string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	for i, x := range e.St.ExtraRoutes {
 		hit := fmt.Sprint(i+1) == key
 		for _, s := range x.SNI {
@@ -323,8 +392,8 @@ func (e *Engine) DelRoute(key string) error {
 
 // ApplyAll перегенерирует всё (после OTA, смены режима и т. п.).
 func (e *Engine) ApplyAll() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	if err := e.infra(); err != nil {
 		return err
 	}
@@ -426,8 +495,8 @@ func (e *Engine) firewall() error {
 
 // AddUser добавляет пользователя.
 func (e *Engine) AddUser(id, name string, opts map[string]string) (*state.User, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	m, err := mod(id)
 	if err != nil {
 		return nil, err
@@ -466,8 +535,8 @@ func validName(s string) bool {
 
 // DelUser удаляет пользователя.
 func (e *Engine) DelUser(id, name string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	m, err := mod(id)
 	if err != nil {
 		return err
@@ -657,10 +726,10 @@ func IDs() []string {
 
 // Preview — проверка плана с новыми параметрами без сохранения.
 func (e *Engine) Preview(id string, params map[string]string) (plan.Result, error) {
-	if !e.mu.TryLock() {
+	if !e.tryLock() {
 		return plan.Result{}, fmt.Errorf("идёт другая операция — повторите позже")
 	}
-	defer e.mu.Unlock()
+	defer e.Unlock()
 	_, existed := e.St.Services[id]
 	s := e.St.Svc(id)
 	saved := *s

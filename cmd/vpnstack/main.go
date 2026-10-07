@@ -2,9 +2,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -41,7 +43,7 @@ const usage = `vpnstack %s — VPN/прокси-стек на одном сер�
   vpnstack update [svc|all]        обновить сервисы до последних версий
   vpnstack self-update [--check] [--tag vX.Y.Z]
                                    обновить сам vpnstack (подписанные релизы)
-  vpnstack panel passwd [пароль] | panel totp on|off | panel url
+  vpnstack panel passwd (спросит пароль) | panel totp on|off | panel url
   vpnstack adopt scan [--json]     найти сервисы, установленные без vpnstack
   vpnstack adopt import [svc...|all] [--force]
                                    считать их настройки и пользователей (ничего не останавливает)
@@ -189,29 +191,31 @@ func run(cmd string, args []string) error {
 			return e.Reconfigure(args[0], p)
 		}
 		p, _ := kv(args)
-		st := e.St
-		for k, v := range p {
-			switch k {
-			case "public_ip":
-				st.PublicIP = v
-			case "email":
-				st.Email = v
-			case "edge_mode":
-				if v != "sni" && v != "ports" {
-					return fmt.Errorf("edge_mode: sni или ports")
+		err := e.Mutate(func(st *state.Stack) error {
+			for k, v := range p {
+				switch k {
+				case "public_ip":
+					st.PublicIP = v
+				case "email":
+					st.Email = v
+				case "edge_mode":
+					if v != "sni" && v != "ports" {
+						return fmt.Errorf("edge_mode: sni или ports")
+					}
+					st.EdgeMode = v
+				case "channel":
+					st.Channel = v
+				case "ota_auto":
+					st.OTA.Auto = v == "true" || v == "1"
+				case "ota_channel":
+					st.OTA.Channel = v
+				default:
+					return fmt.Errorf("неизвестный параметр %s", k)
 				}
-				st.EdgeMode = v
-			case "channel":
-				st.Channel = v
-			case "ota_auto":
-				st.OTA.Auto = v == "true" || v == "1"
-			case "ota_channel":
-				st.OTA.Channel = v
-			default:
-				return fmt.Errorf("неизвестный параметр %s", k)
 			}
-		}
-		if err := st.Save(); err != nil {
+			return nil
+		})
+		if err != nil {
 			return err
 		}
 		return e.ApplyAll()
@@ -371,28 +375,34 @@ func panelCmd(e *core.Engine, args []string) error {
 	}
 	switch args[0] {
 	case "passwd":
-		pw := sys.RandHex(8)
+		pw := ""
 		if len(args) > 1 {
-			pw = args[1]
+			pw = args[1] // осторожно: оболочка раскрывает $ ! ` в аргументах — лучше без аргумента
+		} else if isTTY() {
+			pw = readSecret("Новый пароль панели (пусто — сгенерировать): ")
+			if pw != "" && readSecret("Повторите: ") != pw {
+				return fmt.Errorf("пароли не совпадают")
+			}
+		}
+		if pw == "" {
+			pw = sys.RandHex(8)
 		}
 		h, err := panel.HashPassword(pw)
 		if err != nil {
 			return err
 		}
-		e.St.Panel.PassHash = h
-		if err := e.St.Save(); err != nil {
+		if err := e.Mutate(func(st *state.Stack) error { st.Panel.PassHash = h; return nil }); err != nil {
 			return err
 		}
 		fmt.Printf("логин: %s\nпароль: %s\n", e.St.Panel.Login, pw)
+		fmt.Println("Панель подхватит новый пароль сразу, перезапуск не нужен.")
 	case "totp":
-		if len(args) > 1 && args[1] == "off" {
-			e.St.Panel.TOTP = ""
-		} else {
-			sec := panel.NewTOTPSecret()
-			e.St.Panel.TOTP = sec
+		sec := ""
+		if !(len(args) > 1 && args[1] == "off") {
+			sec = panel.NewTOTPSecret()
 			fmt.Println("Добавьте в приложение-аутентификатор:", panel.TOTPURI(sec, e.St.Panel.Login))
 		}
-		return e.St.Save()
+		return e.Mutate(func(st *state.Stack) error { st.Panel.TOTP = sec; return nil })
 	case "url":
 		fmt.Printf("ssh -N -L 8899:%s root@%s\nзатем откройте http://127.0.0.1:8899\n", e.St.Panel.Listen, e.St.PublicIP)
 	default:
@@ -455,16 +465,18 @@ func setup() error {
 		return err
 	}
 	e := open()
-	if e.St.PublicIP == "" {
-		e.St.PublicIP = sys.PublicIPv4()
-	}
-	if e.St.Panel.PassHash == "" {
-		pw := sys.RandHex(8)
-		h, _ := panel.HashPassword(pw)
-		e.St.Panel.PassHash = h
-		fmt.Printf("Пароль панели (логин %s): %s\n", e.St.Panel.Login, pw)
-	}
-	if err := e.St.Save(); err != nil {
+	if err := e.Mutate(func(st *state.Stack) error {
+		if st.PublicIP == "" {
+			st.PublicIP = sys.PublicIPv4()
+		}
+		if st.Panel.PassHash == "" {
+			pw := sys.RandHex(8)
+			h, _ := panel.HashPassword(pw)
+			st.Panel.PassHash = h
+			fmt.Printf("Пароль панели (логин %s): %s\n", st.Panel.Login, pw)
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	_ = sys.Systemctl("enable", "vpnstack.service")
@@ -610,6 +622,27 @@ func adoptCmd(e *core.Engine, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("vpnstack adopt scan|import|migrate|status|rollback|cleanup")
+}
+
+func isTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// readSecret читает строку без эха.
+func readSecret(prompt string) string {
+	fmt.Print(prompt)
+	off := exec.Command("stty", "-echo")
+	off.Stdin = os.Stdin
+	_ = off.Run()
+	defer func() {
+		on := exec.Command("stty", "echo")
+		on.Stdin = os.Stdin
+		_ = on.Run()
+		fmt.Println()
+	}()
+	l, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	return strings.TrimRight(l, "\r\n")
 }
 
 func adoptState(s string) string {

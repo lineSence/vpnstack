@@ -22,6 +22,7 @@ import (
 	"github.com/lineSence/vpnstack/internal/core"
 	"github.com/lineSence/vpnstack/internal/module"
 	"github.com/lineSence/vpnstack/internal/ota"
+	"github.com/lineSence/vpnstack/internal/state"
 	"github.com/lineSence/vpnstack/internal/stats"
 	"github.com/lineSence/vpnstack/internal/sys"
 	"github.com/lineSence/vpnstack/internal/version"
@@ -209,12 +210,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, 429, fmt.Errorf("слишком много попыток — подождите 15 минут"))
 		return
 	}
-	p := s.E.St.Panel
+	p := s.E.PanelAuth() // пароль мог смениться из CLI, пока панель работает
 	if p.PassHash == "" {
 		fail(w, 403, fmt.Errorf("пароль панели не задан: выполните на сервере `vpnstack panel passwd`"))
 		return
 	}
-	ok := in.Login == p.Login && CheckPassword(p.PassHash, in.Password)
+	ok := strings.EqualFold(strings.TrimSpace(in.Login), p.Login) && CheckPassword(p.PassHash, in.Password)
 	if ok && p.TOTP != "" {
 		ok = CheckTOTP(p.TOTP, in.TOTP)
 	}
@@ -474,30 +475,32 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	st := s.E.St
 	reapply := false
-	if in.Email != nil {
-		st.Email = strings.TrimSpace(*in.Email)
-		reapply = true
-	}
-	if in.PublicIP != nil && net.ParseIP(*in.PublicIP) != nil {
-		st.PublicIP = *in.PublicIP
-		reapply = true
-	}
-	if in.EdgeMode != nil && (*in.EdgeMode == "sni" || *in.EdgeMode == "ports") && *in.EdgeMode != st.EdgeMode {
-		st.EdgeMode = *in.EdgeMode
-		reapply = true
-	}
-	if in.Channel != nil && (*in.Channel == "stable" || *in.Channel == "prerelease") {
-		st.Channel = *in.Channel
-	}
-	if in.OTAAuto != nil {
-		st.OTA.Auto = *in.OTAAuto
-	}
-	if in.OTAChannel != nil && (*in.OTAChannel == "stable" || *in.OTAChannel == "prerelease") {
-		st.OTA.Channel = *in.OTAChannel
-	}
-	if err := st.Save(); err != nil {
+	err := s.E.Mutate(func(st *state.Stack) error {
+		if in.Email != nil {
+			st.Email = strings.TrimSpace(*in.Email)
+			reapply = true
+		}
+		if in.PublicIP != nil && net.ParseIP(*in.PublicIP) != nil {
+			st.PublicIP = *in.PublicIP
+			reapply = true
+		}
+		if in.EdgeMode != nil && (*in.EdgeMode == "sni" || *in.EdgeMode == "ports") && *in.EdgeMode != st.EdgeMode {
+			st.EdgeMode = *in.EdgeMode
+			reapply = true
+		}
+		if in.Channel != nil && (*in.Channel == "stable" || *in.Channel == "prerelease") {
+			st.Channel = *in.Channel
+		}
+		if in.OTAAuto != nil {
+			st.OTA.Auto = *in.OTAAuto
+		}
+		if in.OTAChannel != nil && (*in.OTAChannel == "stable" || *in.OTAChannel == "prerelease") {
+			st.OTA.Channel = *in.OTAChannel
+		}
+		return nil
+	})
+	if err != nil {
 		fail(w, 500, err)
 		return
 	}
@@ -515,7 +518,7 @@ func (s *Server) password(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if !CheckPassword(s.E.St.Panel.PassHash, in.Old) {
+	if !CheckPassword(s.E.PanelAuth().PassHash, in.Old) {
 		fail(w, 403, fmt.Errorf("текущий пароль неверен"))
 		return
 	}
@@ -528,8 +531,10 @@ func (s *Server) password(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, err)
 		return
 	}
-	s.E.St.Panel.PassHash = h
-	_ = s.E.St.Save()
+	if err := s.E.Mutate(func(st *state.Stack) error { st.Panel.PassHash = h; return nil }); err != nil {
+		fail(w, 500, err)
+		return
+	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -543,8 +548,10 @@ func (s *Server) otaAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.otaInfo = in
-		s.E.St.OTA.Checked, s.E.St.OTA.Latest = time.Now().Format(time.RFC3339), in.Latest
-		_ = s.E.St.Save()
+		s.E.TryRun(func() {
+			s.E.St.OTA.Checked, s.E.St.OTA.Latest = time.Now().Format(time.RFC3339), in.Latest
+			_ = s.E.St.Save()
+		})
 		writeJSON(w, 200, in)
 	case "apply":
 		j := s.startJob("self-update", func() error {

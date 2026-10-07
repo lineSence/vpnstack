@@ -83,8 +83,8 @@ func pick(r *adopt.Report, ids []string) ([]*adopt.Found, error) {
 
 // AdoptImport считывает найденные установки в состояние vpnstack (старые продолжают работать).
 func (e *Engine) AdoptImport(ids []string, force bool) ([]string, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	r := e.AdoptScan()
 	found, err := pick(r, ids)
 	if err != nil {
@@ -157,8 +157,8 @@ type MigrateOpts struct {
 //  2. переключение — остановка старых установок и запуск под vpnstack с теми же ключами;
 //  3. проверка — юниты работают, порты слушаются; иначе автоматический откат.
 func (e *Engine) AdoptMigrate(ids []string, o MigrateOpts) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	if err := e.Init(); err != nil {
 		return err
 	}
@@ -619,8 +619,8 @@ func (e *Engine) waitOursFree(set []string, d time.Duration) {
 
 // AdoptRollback возвращает старые установки после переноса.
 func (e *Engine) AdoptRollback(ids []string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	var set []string
 	for id, s := range e.St.Services {
 		if s.Origin == nil || s.Origin.State != state.OriginMigrated {
@@ -640,8 +640,8 @@ func (e *Engine) AdoptRollback(ids []string) error {
 // AdoptCleanup удаляет остановленные старые установки (контейнеры); юниты остаются
 // выключенными, файлы — в резервной копии. После этого откат невозможен.
 func (e *Engine) AdoptCleanup(ids []string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.Lock()
+	defer e.Unlock()
 	n := 0
 	for id, s := range e.St.Services {
 		if s.Origin == nil || s.Origin.State != state.OriginMigrated {

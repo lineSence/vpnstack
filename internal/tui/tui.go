@@ -13,6 +13,7 @@ import (
 	"github.com/lineSence/vpnstack/internal/module"
 	"github.com/lineSence/vpnstack/internal/ota"
 	"github.com/lineSence/vpnstack/internal/panel"
+	"github.com/lineSence/vpnstack/internal/state"
 	"github.com/lineSence/vpnstack/internal/sys"
 	"github.com/lineSence/vpnstack/internal/version"
 )
@@ -111,21 +112,23 @@ func firstRun(e *core.Engine) error {
 	if ip == "" {
 		ip = sys.PublicIPv4()
 	}
-	st.PublicIP = ask("Публичный IPv4 сервера", ip)
-	st.Email = ask("E-mail для сертификатов Let's Encrypt", st.Email)
+	ip = ask("Публичный IPv4 сервера", ip)
+	email := ask("E-mail для сертификатов Let's Encrypt", st.Email)
 	fmt.Println("Режим входа TCP 443:\n 1) общий вход по SNI — все TCP-сервисы на 443 (рекомендуется)\n 2) отдельные порты")
+	mode := "sni"
 	if ask("Выбор", "1") == "2" {
-		st.EdgeMode = "ports"
-	} else {
-		st.EdgeMode = "sni"
+		mode = "ports"
 	}
-	if st.Panel.PassHash == "" {
-		pw := sys.RandHex(8)
-		h, _ := panel.HashPassword(pw)
-		st.Panel.PassHash = h
-		info("Пароль панели (логин %s): %s%s%s — сохраните его", st.Panel.Login, cB, pw, cN)
-	}
-	return st.Save()
+	return e.Mutate(func(st *state.Stack) error {
+		st.PublicIP, st.Email, st.EdgeMode = ip, email, mode
+		if st.Panel.PassHash == "" {
+			pw := sys.RandHex(8)
+			h, _ := panel.HashPassword(pw)
+			st.Panel.PassHash = h
+			info("Пароль панели (логин %s): %s%s%s — сохраните его", st.Panel.Login, cB, pw, cN)
+		}
+		return nil
+	})
 }
 
 func pickModules(e *core.Engine, onlyInstalled bool) []module.Module {
@@ -495,12 +498,14 @@ func panelMenu(e *core.Engine) {
 			pw = sys.RandHex(8)
 		}
 		h, _ := panel.HashPassword(pw)
-		e.St.Panel.PassHash = h
-		_ = e.St.Save()
-		info("Пароль: %s", pw)
+		if err := e.Mutate(func(st *state.Stack) error { st.Panel.PassHash = h; return nil }); err != nil {
+			bad("%v", err)
+			return
+		}
+		info("Пароль: %s (панель подхватит его сразу)", pw)
 	case "2":
 		if e.St.Panel.TOTP != "" {
-			e.St.Panel.TOTP = ""
+			_ = e.Mutate(func(st *state.Stack) error { st.Panel.TOTP = ""; return nil })
 			info("2FA выключена")
 		} else {
 			sec := panel.NewTOTPSecret()
@@ -510,10 +515,9 @@ func panelMenu(e *core.Engine) {
 				bad("Код не подошёл — 2FA не включена")
 				return
 			}
-			e.St.Panel.TOTP = sec
+			_ = e.Mutate(func(st *state.Stack) error { st.Panel.TOTP = sec; return nil })
 			info("2FA включена")
 		}
-		_ = e.St.Save()
 	}
 }
 
@@ -526,11 +530,13 @@ func settings(e *core.Engine) {
 	ch := ask("Канал версий сервисов: stable / prerelease", st.Channel)
 	auto := yes("Автообновление vpnstack (OTA)?", st.OTA.Auto)
 	changed := ip != st.PublicIP || email != st.Email || mode != st.EdgeMode
-	st.PublicIP, st.Email, st.Channel, st.OTA.Auto = ip, email, ch, auto
-	if mode == "sni" || mode == "ports" {
-		st.EdgeMode = mode
-	}
-	_ = st.Save()
+	_ = e.Mutate(func(st *state.Stack) error {
+		st.PublicIP, st.Email, st.Channel, st.OTA.Auto = ip, email, ch, auto
+		if mode == "sni" || mode == "ports" {
+			st.EdgeMode = mode
+		}
+		return nil
+	})
 	if changed && yes("Применить ко всем сервисам сейчас?", true) {
 		sys.Log = os.Stdout
 		if err := e.ApplyAll(); err != nil {
