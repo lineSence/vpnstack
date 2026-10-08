@@ -42,8 +42,15 @@ func (f *FPTN) Params() []module.Param {
 		{Key: "torrent_filter", Label: "Блокировать BitTorrent", Type: module.TBool, Advanced: true, Restart: true},
 		{Key: "spam_filter", Label: "Блокировать спам-трафик (SMTP и т. п.)", Type: module.TBool, Advanced: true, Restart: true},
 		{Key: "mtu", Label: "MTU", Type: module.TInt, Advanced: true, Restart: true},
-		{Key: "legacy_tcp", Label: "Старые TCP-порты → общий вход", Type: module.TList, Advanced: true, Restart: true,
-			Help: "Порты прежней установки: перенаправляются на 443, выданные токены продолжают работать."},
+		{Key: "legacy_tcp", Label: "Старые TCP-порты (напрямую в FPTN)", Type: module.TList, Advanced: true, Restart: true,
+			Help: "Порты прежней установки публикуются прямо из контейнера, минуя общий вход: выданные токены работают как раньше при любом режиме клиента и SNI."},
+		{Key: "dns_server", Label: "DNS-сервер внутри VPN", Type: module.TSelect, Options: []string{"unbound", "dnsmasq"}, Advanced: true, Restart: true},
+		{Key: "dns4_primary", Label: "Основной DNS IPv4", Type: module.TString, Advanced: true, Restart: true},
+		{Key: "dns4_secondary", Label: "Запасной DNS IPv4", Type: module.TString, Advanced: true, Restart: true},
+		{Key: "dns6_enable", Label: "DNS по IPv6", Type: module.TBool, Advanced: true, Restart: true},
+		{Key: "dns6_primary", Label: "Основной DNS IPv6", Type: module.TString, Advanced: true, Restart: true},
+		{Key: "dns6_secondary", Label: "Запасной DNS IPv6", Type: module.TString, Advanced: true, Restart: true},
+		{Key: "ads_blocklist_urls", Label: "Списки блокировки рекламы (URL через запятую)", Type: module.TString, Advanced: true, Restart: true},
 	}
 }
 
@@ -56,6 +63,12 @@ func (f *FPTN) AutoDefaults(env *module.Env, s *state.Service) error {
 	s.Default("torrent_filter", "true")
 	s.Default("spam_filter", "true")
 	s.Default("mtu", "1400")
+	s.Default("dns_server", "unbound")
+	s.Default("dns4_primary", "8.8.8.8")
+	s.Default("dns4_secondary", "8.8.4.4")
+	s.Default("dns6_enable", "false")
+	s.Default("dns6_primary", "2001:4860:4860::8888")
+	s.Default("dns6_secondary", "2001:4860:4860::8844")
 	if s.P("subnet4") == "" {
 		for _, c := range []string{"192.168.200.0/24", "192.168.201.0/24", "192.168.210.0/24", "172.30.200.0/24"} {
 			if sys.SubnetFree(c) {
@@ -73,7 +86,10 @@ func (f *FPTN) Needs(env *module.Env, s *state.Service) []module.Need {
 	if env.EdgeEnabled {
 		n := []module.Need{{Proto: "tcp", Port: fptnLocal, Purpose: "FPTN за общим входом",
 			Edge: &module.EdgeRoute{SNI: list(s, "sni_list"), Backend: fmt.Sprintf("127.0.0.1:%d", fptnLocal), Priority: 20}}}
-		return append(n, legacyNeeds(s, "FPTN")...)
+		for _, p := range f.legacyPorts(s) {
+			n = append(n, module.Need{Proto: "tcp", Port: p, Public: true, Purpose: "FPTN: старый порт (напрямую, без общего входа)"})
+		}
+		return n
 	}
 	return []module.Need{{Proto: "tcp", Port: atoi(s.P("port")), Public: true, Param: "port", Purpose: "FPTN"}}
 }
@@ -86,16 +102,20 @@ func (f *FPTN) Latest(env *module.Env) (string, error) {
 func (f *FPTN) compose(env *module.Env, s *state.Service) string {
 	gw4 := strings.TrimSuffix(s.P("subnet4"), ".0/24") + ".1"
 	gw6 := strings.TrimSuffix(s.P("subnet6"), "::/48") + "::1"
-	port := fmt.Sprintf("127.0.0.1:%d:443/tcp", fptnLocal)
-	if !env.EdgeEnabled {
-		port = s.P("port") + ":443/tcp"
+	ports := []string{s.P("port") + ":443/tcp"}
+	if env.EdgeEnabled {
+		ports = []string{fmt.Sprintf("127.0.0.1:%d:443/tcp", fptnLocal)}
+		for _, p := range f.legacyPorts(s) {
+			ports = append(ports, fmt.Sprintf("%d:443/tcp", p))
+		}
 	}
+	port := `"` + strings.Join(ports, `", "`) + `"`
 	return fmt.Sprintf(`# Сгенерировано vpnstack по официальному docker-compose FPTN
 services:
   fptn-server:
     restart: unless-stopped
-    image: %[1]s:%[2]s
-    cgroup_parent: %[3]s
+    image: %[1]s
+    cgroup_parent: %[2]s
     privileged: true
     cap_add: [NET_ADMIN, SYS_MODULE, NET_RAW, SYS_ADMIN, SYS_RESOURCE]
     sysctls:
@@ -108,7 +128,7 @@ services:
       nofile: {soft: 524288, hard: 524288}
       memlock: {soft: 524288, hard: 524288}
     devices: ["/dev/net/tun:/dev/net/tun"]
-    ports: ["%[4]s"]
+    ports: [%[3]s]
     volumes: ["./fptn-server-data:/etc/fptn"]
     env_file: [fptn.env]
     healthcheck:
@@ -124,9 +144,9 @@ networks:
     enable_ipv6: true
     ipam:
       config:
-        - {subnet: "%[5]s", gateway: "%[6]s"}
-        - {subnet: "%[7]s", gateway: "%[8]s"}
-`, fptnImage, s.Version, sys.SliceName(f.id), port, s.P("subnet6"), gw6, s.P("subnet4"), gw4)
+        - {subnet: "%[4]s", gateway: "%[5]s"}
+        - {subnet: "%[6]s", gateway: "%[7]s"}
+`, f.image(s.Version), sys.SliceName(f.id), port, s.P("subnet6"), gw6, s.P("subnet4"), gw4)
 }
 
 func (f *FPTN) envFile(env *module.Env, s *state.Service) string {
@@ -147,10 +167,15 @@ func (f *FPTN) envFile(env *module.Env, s *state.Service) string {
 		{"REMOTE_SERVER_AUTH_PORT", "443"},
 		{"MAX_ACTIVE_SESSIONS_PER_USER", s.P("max_sessions")},
 		{"MTU_SIZE", s.P("mtu")},
-		{"USING_DNS_SERVER", "unbound"},
-		{"DNS_IPV6_ENABLE", "false"},
-		{"DNS_IPV4_PRIMARY", "8.8.8.8"},
-		{"DNS_IPV4_SECONDARY", "8.8.4.4"},
+		{"USING_DNS_SERVER", s.P("dns_server")},
+		{"DNS_IPV6_ENABLE", s.P("dns6_enable")},
+		{"DNS_IPV4_PRIMARY", s.P("dns4_primary")},
+		{"DNS_IPV4_SECONDARY", s.P("dns4_secondary")},
+		{"DNS_IPV6_PRIMARY", s.P("dns6_primary")},
+		{"DNS_IPV6_SECONDARY", s.P("dns6_secondary")},
+	}
+	if v := s.P("ads_blocklist_urls"); v != "" {
+		kv = append(kv, [2]string{"ADS_BLOCKLIST_URLS", v})
 	}
 	var b strings.Builder
 	for _, p := range kv {
@@ -300,7 +325,7 @@ func (f *FPTN) Prefetch(env *module.Env, s *state.Service) error {
 			return err
 		}
 	}
-	_, err := sys.Run("docker", "pull", fptnImage+":"+v)
+	_, err := sys.Run("docker", "pull", f.image(v))
 	return err
 }
 
@@ -374,4 +399,28 @@ func (f *FPTN) Artifacts(env *module.Env, s *state.Service, u *state.User) ([]mo
 		return []module.Artifact{{Kind: "token", Title: "Токен FPTN (вставить в клиент FPTN)", Value: t, QR: true}}, nil
 	}
 	return []module.Artifact{{Kind: "text", Title: "Вывод token-generator", Value: u.Data["token_output"]}}, nil
+}
+
+// image — ссылка на образ: тег («0.4.6») или закреплённый дайджест («@sha256:…»),
+// который перенос сохраняет для установок на «latest».
+func (f *FPTN) image(v string) string {
+	if strings.HasPrefix(v, "@") {
+		return fptnImage + v
+	}
+	return fptnImage + ":" + v
+}
+
+// legacyPorts — старые публичные порты перенятой установки. FPTN получает их напрямую:
+// через общий вход прошли бы только TLS-соединения с SNI из списка, а клиент в режиме
+// обфускации или с другим SNI оказался бы в Caddy.
+func (f *FPTN) legacyPorts(s *state.Service) []int {
+	var out []int
+	seen := map[int]bool{}
+	for _, p := range list(s, "legacy_tcp") {
+		if port := atoi(p); port > 0 && port != 443 && port != fptnLocal && !seen[port] {
+			seen[port] = true
+			out = append(out, port)
+		}
+	}
+	return out
 }

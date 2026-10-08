@@ -7,6 +7,7 @@ import (
 
 type dockerC struct {
 	ID, Name, Image, Restart string
+	ImageID                  string // sha256 локального образа (по нему находится точный дайджест)
 	Pid                      int
 	Env                      map[string]string
 	Mounts                   map[string]string // назначение → источник на хосте
@@ -29,9 +30,10 @@ func dockerPS() []dockerC {
 
 func parseDockerInspect(out string) []dockerC {
 	var raw []struct {
-		ID    string `json:"Id"`
-		Name  string `json:"Name"`
-		State struct {
+		ID      string `json:"Id"`
+		Name    string `json:"Name"`
+		ImageID string `json:"Image"`
+		State   struct {
 			Pid int `json:"Pid"`
 		} `json:"State"`
 		Config struct {
@@ -58,7 +60,7 @@ func parseDockerInspect(out string) []dockerC {
 	}
 	var res []dockerC
 	for _, r := range raw {
-		c := dockerC{ID: r.ID, Name: strings.TrimPrefix(r.Name, "/"), Image: r.Config.Image, Pid: r.State.Pid,
+		c := dockerC{ID: r.ID, Name: strings.TrimPrefix(r.Name, "/"), Image: r.Config.Image, ImageID: r.ImageID, Pid: r.State.Pid,
 			Restart: r.HostConfig.RestartPolicy.Name, Env: map[string]string{}, Mounts: map[string]string{}, Ports: map[string]int{}, Labels: r.Config.Labels}
 		for _, kv := range r.Config.Env {
 			if k, v, ok := strings.Cut(kv, "="); ok {
