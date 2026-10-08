@@ -1,6 +1,7 @@
 package adopt
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,7 +57,10 @@ func importFPTN(f *Found, c dockerC) {
 			"клиенты с другим SNI перестанут подключаться. Задайте список: vpnstack set fptn sni_list=…")
 	}
 	for env, p := range map[string]string{"MAX_ACTIVE_SESSIONS_PER_USER": "max_sessions", "MTU_SIZE": "mtu",
-		"ENABLE_ADS_FILTER": "ads_filter", "ENABLE_TORRENT_FILTER": "torrent_filter", "ENABLE_SPAM_FILTER": "spam_filter"} {
+		"ENABLE_ADS_FILTER": "ads_filter", "ENABLE_TORRENT_FILTER": "torrent_filter", "ENABLE_SPAM_FILTER": "spam_filter",
+		"USING_DNS_SERVER": "dns_server", "DNS_IPV4_PRIMARY": "dns4_primary", "DNS_IPV4_SECONDARY": "dns4_secondary",
+		"DNS_IPV6_ENABLE": "dns6_enable", "DNS_IPV6_PRIMARY": "dns6_primary", "DNS_IPV6_SECONDARY": "dns6_secondary",
+		"ADS_BLOCKLIST_URLS": "ads_blocklist_urls"} {
 		if v := c.Env[env]; v != "" {
 			f.Params[p] = v
 		}
@@ -64,8 +68,11 @@ func importFPTN(f *Found, c dockerC) {
 	if c.Env["USE_REMOTE_SERVER_AUTH"] == "true" {
 		f.Blocking = append(f.Blocking, "включена удалённая авторизация (USE_REMOTE_SERVER_AUTH) — пользователи хранятся на другом сервере")
 	}
-	if _, tag, ok := strings.Cut(c.Image, ":"); ok && tag != "latest" && !strings.Contains(tag, "@") {
-		f.Params["_version"] = tag
+	f.Params["_version"] = fptnImageVersion(c, imageRepoDigests(c.ImageID))
+	if f.Params["_version"] == "" {
+		delete(f.Params, "_version")
+		f.Warnings = append(f.Warnings, "не удалось определить точную версию образа "+c.Image+
+			" — при переносе будет установлена последняя версия FPTN")
 	}
 	b, err := os.ReadFile(filepath.Join(data, "users.list"))
 	if err != nil {
@@ -88,4 +95,39 @@ func importFPTN(f *Found, c dockerC) {
 			f.Warnings = append(f.Warnings, "нет "+k+" в "+data+" — будет создан новый ключ, клиентам потребуются новые токены")
 		}
 	}
+}
+
+// fptnImageVersion — версия, которую перенос должен сохранить: явный тег образа, а для
+// «latest» (или без тега) — точный дайджест локального образа. «latest» на Docker Hub
+// мог уйти вперёд, и перенос незаметно обновил бы сервер.
+func fptnImageVersion(c dockerC, digests []string) string {
+	ref := c.Image
+	if _, d, ok := strings.Cut(ref, "@"); ok {
+		return "@" + d
+	}
+	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
+		if tag := ref[i+1:]; tag != "" && tag != "latest" {
+			return tag
+		}
+	}
+	for _, d := range digests {
+		if name, sum, ok := strings.Cut(d, "@"); ok && strings.HasSuffix(name, "fptn-vpn-server") && strings.HasPrefix(sum, "sha256:") {
+			return "@" + sum
+		}
+	}
+	return ""
+}
+
+// imageRepoDigests — дайджесты реестра для локального образа.
+func imageRepoDigests(id string) []string {
+	if id == "" {
+		return nil
+	}
+	out, err := run("docker", "image", "inspect", "--format", "{{json .RepoDigests}}", id)
+	if err != nil {
+		return nil
+	}
+	var d []string
+	_ = json.Unmarshal([]byte(strings.TrimSpace(out)), &d)
+	return d
 }
